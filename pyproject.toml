@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyappify"
+version = "0.0.3"
+description = "My awesome Python application"
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+pyappify = "pyappify.main:main"
+
+[project.optional-dependencies]
+dev = ["twine", "build"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pyappify"]
