@@ -13,23 +13,68 @@ pyappify_version = os.environ.get("PYAPPIFY_VERSION")
 pyappify_executable = os.environ.get("PYAPPIFY_EXECUTABLE")
 
 pyappify_upgradeable = os.environ.get("PYAPPIFY_UPGRADEABLE") == '1'
+logger = None
 
 try:
     pid = int(os.environ.get("PYAPPIFY_PID"))
 except (ValueError, TypeError):
     pid = None
 
+import sys
+
+try:
+    import ctypes
+except ImportError:
+    ctypes = None
+
+
+def minimize_window_by_pid(pid):
+    if not ctypes or sys.platform != "win32":
+        return False
+
+    found_hwnd = []
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+
+    def enum_windows_callback(hwnd, lParam):
+        owner_pid = ctypes.c_ulong()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+        if owner_pid.value == pid and ctypes.windll.user32.IsWindowVisible(hwnd):
+            found_hwnd.append(hwnd)
+            return False
+        return True
+
+    ctypes.windll.user32.EnumWindows(EnumWindowsProc(enum_windows_callback), 0)
+
+    if found_hwnd:
+        ctypes.windll.user32.ShowWindow(found_hwnd[0], 6)
+        return True
+
+    return False
 
 def kill_pyappify():
     if pid:
+        if logger:
+            logger.info(f"Attempting to terminate process with PID: {pid}")
         try:
             os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
+        except Exception as e:
+            if logger:
+                logger.error(f"Failed to terminate process with PID {pid}: {e}")
             pass
 
+def hide_pyappify():
+    if pid:
+        if logger:
+            logger.info(f"Attempting to minimize window for process with PID: {pid}")
+        try:
+            minimize_window_by_pid(pid)
+        except Exception as e:
+            if logger:
+                logger.error(f"Failed to minimize window for process with PID {pid}: {e}")
+            pass
 
-def upgrade(to_version, executable_sha256, executable_zip_urls, logger=None, stop_event=None):
-    if not pyappify_upgradeable or to_version == pyappify_version:
+def upgrade(to_version, executable_sha256, executable_zip_urls, stop_event=None):
+    if not pyappify_upgradeable or (to_version and to_version.lstrip('v') == pyappify_version.lstrip('v')):
         return
 
     def _do_upgrade():
