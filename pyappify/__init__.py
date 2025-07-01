@@ -74,37 +74,47 @@ def hide_pyappify():
             pass
 
 def upgrade(to_version, executable_sha256, executable_zip_urls, stop_event=None):
-    if not pyappify_upgradeable or (to_version and to_version.lstrip('v') == pyappify_version.lstrip('v')):
+    if not pyappify_upgradeable or not is_greater_version(to_version, pyappify_version):
+        if logger:
+            logger.info(f"pyappify no need to upgrade {pyappify_upgradeable} {to_version} {executable_sha256} {executable_zip_urls}")
         return
-
+    if logger:
+        logger.info(
+            f"pyappify start to upgrade {pyappify_upgradeable} {to_version} {executable_sha256} {executable_zip_urls}")
     def _do_upgrade():
-        tmp_dir = os.path.join(os.getcwd(), "tmp")
+        tmp_dir = os.path.join(os.getcwd(), "pyappify_tmp")
         try:
             os.makedirs(tmp_dir, exist_ok=True)
             downloaded_zip_path = None
             for url in executable_zip_urls:
                 try:
+                    if logger:
+                        logger.info(
+                            f"pyappify start to download {url}")
                     local_zip_path = os.path.join(tmp_dir, os.path.basename(url))
                     with urllib.request.urlopen(url) as response, open(local_zip_path, 'wb') as out_file:
                         while True:
                             if stop_event and stop_event.is_set():
                                 if logger:
-                                    logger.info("Upgrade download cancelled by stop event.")
+                                    logger.info("pyappify Upgrade download cancelled by stop event.")
                                 return
                             chunk = response.read(8192)
                             if not chunk:
                                 break
                             out_file.write(chunk)
                     downloaded_zip_path = local_zip_path
+                    if logger:
+                        logger.info(
+                            f"pyappify download success {url}")
                     break
                 except Exception as e:
                     if logger:
-                        logger.warning(f"Failed to download from {url}: {e}")
+                        logger.warning(f"pyappify Failed to download from {url}: {e}")
                     continue
 
             if not downloaded_zip_path:
                 if logger:
-                    logger.error("Failed to download upgrade.")
+                    logger.error("pyappify Failed to download upgrade.")
                 return
 
             with zipfile.ZipFile(downloaded_zip_path, 'r') as zip_ref:
@@ -119,7 +129,7 @@ def upgrade(to_version, executable_sha256, executable_zip_urls, stop_event=None)
 
             if not found_executable_path:
                 if logger:
-                    logger.error("Executable not found in zip.")
+                    logger.error("pyappify Executable not found in zip.")
                 return
 
             sha256_hash = hashlib.sha256()
@@ -129,14 +139,16 @@ def upgrade(to_version, executable_sha256, executable_zip_urls, stop_event=None)
 
             if sha256_hash.hexdigest() != executable_sha256:
                 if logger:
-                    logger.error("SHA256 checksum mismatch.")
+                    logger.error("pyappify SHA256 checksum mismatch.")
                 return
 
             kill_pyappify()
             shutil.move(found_executable_path, pyappify_executable)
+            if logger:
+                logger.info(f"pyappify Upgrade success")
         except Exception as e:
             if logger:
-                logger.error(f"Upgrade failed: {e}")
+                logger.error(f"pyappify Upgrade failed: {e}")
         finally:
             if os.path.exists(tmp_dir):
                 shutil.rmtree(tmp_dir)
@@ -144,3 +156,24 @@ def upgrade(to_version, executable_sha256, executable_zip_urls, stop_event=None)
     thread = threading.Thread(target=_do_upgrade)
     thread.daemon = True
     thread.start()
+
+def is_greater_version(version1, version2):
+    """
+    Compares two semantic version strings.
+
+    Args:
+        version1 (str): The first version string.
+        version2 (str): The second version string.
+
+    Returns:
+        bool: True if version1 is strictly greater than version2,
+              False otherwise or if parsing fails.
+    """
+    try:
+        version1 = version1.lstrip('v')
+        version2 = version2.lstrip('v')
+        v1_parts = [int(p) for p in version1.split('.')]
+        v2_parts = [int(p) for p in version2.split('.')]
+        return v1_parts > v2_parts
+    except (ValueError, AttributeError):
+        return False
