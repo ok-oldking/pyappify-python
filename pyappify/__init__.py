@@ -137,7 +137,7 @@ def upgrade(to_version, executable_sha256, executable_zip_urls, stop_event=None)
                 for byte_block in iter(lambda: f.read(4096), b""):
                     sha256_hash.update(byte_block)
 
-            if sha256_hash.hexdigest() != executable_sha256:
+            if executable_sha256 and sha256_hash.hexdigest() != executable_sha256:
                 if logger:
                     logger.error("pyappify SHA256 checksum mismatch.")
                 return
