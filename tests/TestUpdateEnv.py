@@ -9,6 +9,8 @@ ENV_KEYS = (
     "PYAPPIFY_APP_VERSION",
     "PYAPPIFY_APP_STARTING_VERSION",
     "PYAPPIFY_UPDATE_NOTE",
+    "PYAPPIFY_APP_JSON_PATH",
+    "PYAPPIFY_LOCALE",
 )
 
 
@@ -88,6 +90,10 @@ class TestUpdateEnv(unittest.TestCase):
             [],
             self._reload_with_env(PYAPPIFY_UPDATE_NOTE='"single note"').get_update_notes(),
         )
+
+    def test_reads_locale_with_english_fallback(self):
+        self.assertEqual("zh-CN", self._reload_with_env(PYAPPIFY_LOCALE="zh-CN").get_locale())
+        self.assertEqual("en", self._reload_with_env().get_locale())
 
 
 if __name__ == "__main__":
