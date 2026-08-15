@@ -337,6 +337,10 @@ def get_version_list(number_versions=10, release_only=True, timeout=300):
     if not isinstance(release_only, bool):
         raise TypeError("release_only must be a boolean")
 
+    if "PYAPPIFY_PYTHON_TEST" in os.environ:
+        time.sleep(5)
+        return _get_mock_version_list(number_versions)
+
     response = _run_launcher_api(
         [
             "--get-version-list",
@@ -357,10 +361,52 @@ def get_versions(number_versions=10, release_only=True, timeout=300):
     return get_version_list(number_versions, release_only, timeout)
 
 
+def calculate_update_notes(update_notes, current_version, target_version):
+    """Return descending notes without including versions newer than the target."""
+    if not isinstance(update_notes, list):
+        raise TypeError("update_notes must be a list")
+
+    versions = [
+        item for item in update_notes
+        if isinstance(item, dict) and item.get("version")
+    ]
+
+    def normalize(version):
+        return str(version or "").lstrip("v")
+
+    def find_index(version):
+        normalized = normalize(version)
+        return next(
+            (index for index, item in enumerate(versions)
+             if normalize(item["version"]) == normalized),
+            None,
+        )
+
+    target_index = find_index(target_version)
+    if target_index is None:
+        return []
+
+    current_index = find_index(current_version)
+    if current_index is None:
+        selected_versions = versions[target_index:]
+    else:
+        first = min(current_index, target_index)
+        last = max(current_index, target_index)
+        selected_versions = versions[first:last + 1]
+
+    notes = []
+    for item in selected_versions:
+        raw_notes = item.get("update_note") or []
+        notes.extend(raw_notes if isinstance(raw_notes, list) else [raw_notes])
+    return [str(note) for note in notes]
+
+
 def update_to_version(version, timeout=300):
     """Start PyAppify (or forward to it) and update the managed app to version."""
     if not isinstance(version, str) or not version.strip():
         raise ValueError("version must be a non-empty string")
+    if "PYAPPIFY_PYTHON_TEST" in os.environ:
+        return {"updated": True, "version": version, "mocked": True}
     response = _run_launcher_api(
         ["--update-to-version", version],
         timeout=timeout,
@@ -368,6 +414,53 @@ def update_to_version(version, timeout=300):
     if not isinstance(response, dict) or not response.get("updated"):
         raise RuntimeError("PyAppify returned an invalid update response")
     return response
+
+
+def _get_mock_version_list(number_versions):
+    """Return deterministic launcher data for UI and integration tests."""
+    current = app_version or "v1.0.0"
+    prefix = "v" if current.startswith("v") else ""
+    try:
+        parts = [int(part) for part in current.lstrip("v").split(".")]
+    except (TypeError, ValueError):
+        parts = [1, 0, 0]
+        prefix = "v"
+    parts = (parts + [0, 0, 0])[:3]
+
+    def previous_parts(version_parts):
+        major, minor, patch = version_parts
+        if patch > 0:
+            return [major, minor, patch - 1]
+        if minor > 0:
+            return [major, minor - 1, 9]
+        if major > 0:
+            return [major - 1, 9, 9]
+        return None
+
+    version_parts = [[100, 1, 1], parts[:2] + [parts[2] + 2], parts[:2] + [parts[2] + 1], parts]
+    previous = previous_parts(parts)
+    while len(version_parts) < number_versions:
+        if previous is not None:
+            version_parts.append(previous)
+            previous = previous_parts(previous)
+        else:
+            break
+
+    versions = []
+    for item_parts in version_parts:
+        item_prefix = "v" if item_parts == [100, 1, 1] else prefix
+        version = item_prefix + ".".join(str(part) for part in item_parts)
+        previous_item = previous_parts(item_parts)
+        previous = item_prefix + ".".join(str(part) for part in previous_item) if previous_item else version
+        versions.append({
+            "version": version,
+            "previous_version": previous,
+            "update_note": [
+                f"Mock update note for {version}",
+                f"Changes since {previous}",
+            ],
+        })
+    return versions[:number_versions]
 
 
 def _replace_executable(source_path, target_path, timeout=30):

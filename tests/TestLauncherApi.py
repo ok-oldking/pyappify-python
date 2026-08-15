@@ -93,6 +93,48 @@ class TestLauncherApi(unittest.TestCase):
         self.assertEqual({"updated": True, "version": "v2.0.0"}, result)
         run.assert_called_once_with(["--update-to-version", "v2.0.0"], timeout=300)
 
+    def test_calculate_update_notes_returns_inclusive_descending_range(self):
+        versions = [
+            {"version": "v0.9.9", "update_note": ["note 0.9.9"]},
+            {"version": "v0.9.8", "update_note": ["note 0.9.8"]},
+            {"version": "v0.9.7", "update_note": ["note 0.9.7"]},
+            {"version": "v0.9.6", "update_note": ["note 0.9.6"]},
+        ]
+
+        notes = pyappify.calculate_update_notes(versions, "v0.9.7", "v0.9.9")
+
+        self.assertEqual(["note 0.9.9", "note 0.9.8", "note 0.9.7"], notes)
+
+    def test_calculate_update_notes_excludes_versions_above_target_when_current_is_missing(self):
+        versions = [
+            {"version": "v3.0.0", "update_note": ["three"]},
+            {"version": "v2.0.0", "update_note": ["two"]},
+            {"version": "v1.0.0", "update_note": "one"},
+        ]
+
+        notes = pyappify.calculate_update_notes(versions, "dev", "v2.0.0")
+
+        self.assertEqual(["two", "one"], notes)
+
+    def test_test_environment_returns_mocked_data_without_launcher(self):
+        with mock.patch.dict(
+            os.environ,
+            {"PYAPPIFY_PYTHON_TEST": "1"},
+        ), mock.patch.object(pyappify, "app_version", "v1.2.3"), mock.patch.object(
+            pyappify, "_run_launcher_api"
+        ) as run, mock.patch.object(pyappify.time, "sleep") as sleep:
+            versions = pyappify.get_version_list(3)
+            result = pyappify.update_to_version("v1.2.4")
+
+        self.assertEqual(["v100.1.1", "v1.2.5", "v1.2.4"], [v["version"] for v in versions])
+        self.assertEqual("v100.1.0", versions[0]["previous_version"])
+        self.assertEqual(
+            {"updated": True, "version": "v1.2.4", "mocked": True},
+            result,
+        )
+        run.assert_not_called()
+        sleep.assert_called_once_with(5)
+
 
 if __name__ == "__main__":
     unittest.main()
