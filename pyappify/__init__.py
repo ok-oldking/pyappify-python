@@ -328,7 +328,7 @@ def _run_launcher_api(arguments, timeout=300):
     raise TimeoutError("Timed out waiting for a response from PyAppify")
 
 
-def get_version_list(number_versions=10, release_only=True, timeout=300):
+def get_version_list(number_versions=10, release_only=True, timeout=120):
     """Return the latest versions and each version's notes since its predecessor."""
     if isinstance(number_versions, bool) or not isinstance(number_versions, int):
         raise TypeError("number_versions must be an integer")
@@ -356,7 +356,7 @@ def get_version_list(number_versions=10, release_only=True, timeout=300):
     return response
 
 
-def get_versions(number_versions=10, release_only=True, timeout=300):
+def get_versions(number_versions=10, release_only=True, timeout=120):
     """Alias for get_version_list."""
     return get_version_list(number_versions, release_only, timeout)
 

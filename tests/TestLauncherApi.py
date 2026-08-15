@@ -83,6 +83,33 @@ class TestLauncherApi(unittest.TestCase):
         self.assertIn("false", command)
         self.assertEqual(root, popen.call_args.kwargs["cwd"])
 
+    def test_get_version_list_has_a_two_minute_default_timeout(self):
+        with mock.patch.object(
+            pyappify, "_run_launcher_api", return_value=[]
+        ) as run:
+            result = pyappify.get_version_list()
+
+        self.assertEqual([], result)
+        run.assert_called_once_with(
+            [
+                "--get-version-list",
+                "--number-versions",
+                "10",
+                "--release-only",
+                "true",
+            ],
+            timeout=120,
+        )
+
+    def test_get_version_list_returns_timeout_as_an_error(self):
+        with mock.patch.object(
+            pyappify,
+            "_run_launcher_api",
+            side_effect=TimeoutError("Timed out waiting for a response from PyAppify"),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "Timed out waiting"):
+                pyappify.get_version_list()
+
     def test_update_to_version_returns_launcher_result(self):
         pyappify.pyappify_executable = os.path.abspath("pyappify.exe")
         with mock.patch.object(pyappify.os.path, "isfile", return_value=True), mock.patch.object(
