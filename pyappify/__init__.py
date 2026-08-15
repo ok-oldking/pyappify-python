@@ -58,13 +58,14 @@ except ImportError:
 
 
 def find_pyappify_executable(start_dir=None, environ=None):
-    """Find the launcher configured by PyAppify or in a parent directory."""
+    """Find the configured launcher or an app launcher above ``working``."""
     environ = os.environ if environ is None else environ
     configured = environ.get("PYAPPIFY_EXECUTABLE")
     if configured:
         configured_path = Path(configured).expanduser()
         if configured_path.is_file():
             return str(configured_path.resolve())
+        return None
 
     current = Path(start_dir or os.getcwd()).expanduser()
     if current.is_file():
@@ -74,12 +75,52 @@ def find_pyappify_executable(start_dir=None, environ=None):
     except OSError:
         current = current.absolute()
 
-    executable_names = ("pyappify.exe", "pyappify")
-    for directory in (current,) + tuple(current.parents):
-        for executable_name in executable_names:
-            candidate = directory / executable_name
-            if candidate.is_file():
-                return str(candidate.resolve())
+    working_directory = next(
+        (
+            directory
+            for directory in (current,) + tuple(current.parents)
+            if directory.name.casefold() == "working" and directory.parent.name
+        ),
+        None,
+    )
+    if working_directory is None:
+        return None
+
+    app_name = working_directory.parent.name
+    apps_directory = working_directory.parent.parent
+    data_directory = apps_directory.parent
+    if apps_directory.name.casefold() != "apps" or data_directory.name.casefold() != "data":
+        return None
+
+    app_root = data_directory.parent
+    exact_launcher_name = "{} Launcher.exe".format(app_name).casefold()
+    search_directories = []
+    directory = working_directory
+    while True:
+        search_directories.append(directory)
+        if directory == app_root:
+            break
+        directory = directory.parent
+
+    for directory in search_directories:
+        try:
+            candidates = [
+                candidate
+                for candidate in directory.iterdir()
+                if candidate.is_file()
+                and candidate.suffix.casefold() == ".exe"
+                and candidate.name.casefold().startswith(app_name.casefold())
+            ]
+        except OSError:
+            continue
+        if candidates:
+            candidates.sort(
+                key=lambda candidate: (
+                    candidate.name.casefold() != exact_launcher_name,
+                    candidate.name.casefold(),
+                )
+            )
+            return str(candidates[0].resolve())
     return None
 
 
@@ -291,7 +332,8 @@ def _require_pyappify_executable():
     if not pyappify_executable:
         raise FileNotFoundError(
             "PyAppify executable was not found. Set PYAPPIFY_EXECUTABLE to an "
-            "existing executable or place pyappify.exe in this directory or a parent directory."
+            "existing executable or place an executable whose name starts with the app name "
+            "in the working directory or a parent directory."
         )
     return pyappify_executable
 

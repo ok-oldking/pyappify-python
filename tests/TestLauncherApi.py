@@ -21,11 +21,11 @@ class TestLauncherApi(unittest.TestCase):
             root = Path(root)
             configured = root / "configured.exe"
             configured.touch()
-            fallback = root / "pyappify.exe"
+            fallback = root / "example Launcher.exe"
             fallback.touch()
 
             found = pyappify.find_pyappify_executable(
-                start_dir=root / "nested" / "working",
+                start_dir=root / "data" / "apps" / "example" / "working",
                 environ={"PYAPPIFY_EXECUTABLE": str(configured)},
             )
 
@@ -34,7 +34,7 @@ class TestLauncherApi(unittest.TestCase):
     def test_finds_executable_by_walking_parent_directories(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
-            executable = root / "pyappify.exe"
+            executable = root / "example Launcher.exe"
             executable.touch()
             working = root / "data" / "apps" / "example" / "working"
             working.mkdir(parents=True)
@@ -45,6 +45,71 @@ class TestLauncherApi(unittest.TestCase):
             )
 
         self.assertEqual(str(executable.resolve()), found)
+
+    def test_finds_app_launcher_from_a_directory_below_working(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            executable = root / "Example App Launcher.exe"
+            executable.touch()
+            nested = root / "data" / "apps" / "Example App" / "working" / "src"
+            nested.mkdir(parents=True)
+
+            found = pyappify.find_pyappify_executable(start_dir=nested, environ={})
+
+        self.assertEqual(str(executable.resolve()), found)
+
+    def test_prefers_conventional_launcher_name(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            other_executable = root / "example Helper.exe"
+            other_executable.touch()
+            launcher = root / "example Launcher.exe"
+            launcher.touch()
+            working = root / "data" / "apps" / "example" / "working"
+            working.mkdir(parents=True)
+
+            found = pyappify.find_pyappify_executable(start_dir=working, environ={})
+
+        self.assertEqual(str(launcher.resolve()), found)
+
+    def test_does_not_fall_back_to_pyappify_executable(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            (root / "pyappify.exe").touch()
+            working = root / "data" / "apps" / "example" / "working"
+            working.mkdir(parents=True)
+
+            found = pyappify.find_pyappify_executable(start_dir=working, environ={})
+
+        self.assertIsNone(found)
+
+    def test_does_not_search_above_app_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            executable = root / "example Launcher.exe"
+            executable.touch()
+            app_root = root / "installed-app"
+            working = app_root / "data" / "apps" / "example" / "working"
+            working.mkdir(parents=True)
+
+            found = pyappify.find_pyappify_executable(start_dir=working, environ={})
+
+        self.assertIsNone(found)
+
+    def test_invalid_configured_executable_does_not_use_fallback(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            launcher = root / "example Launcher.exe"
+            launcher.touch()
+            working = root / "data" / "apps" / "example" / "working"
+            working.mkdir(parents=True)
+
+            found = pyappify.find_pyappify_executable(
+                start_dir=working,
+                environ={"PYAPPIFY_EXECUTABLE": str(root / "missing.exe")},
+            )
+
+        self.assertIsNone(found)
 
     def test_missing_executable_raises_a_clear_error(self):
         pyappify.pyappify_executable = None
