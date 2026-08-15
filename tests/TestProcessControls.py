@@ -1,5 +1,6 @@
 import os
 import signal
+import threading
 import unittest
 from unittest import mock
 
@@ -27,7 +28,23 @@ class TestProcessControls(unittest.TestCase):
             self.assertTrue(pyappify.kill_pyappify_exe(timeout=5))
 
         kill.assert_called_once_with(1234, signal.SIGTERM)
-        wait.assert_called_once_with(1234, 5)
+        wait.assert_called_once_with(1234, 5, exit_event=None)
+
+    def test_process_wait_stops_when_exit_event_is_set(self):
+        exit_event = threading.Event()
+        exit_event.set()
+
+        with mock.patch.object(pyappify.sys, "platform", "linux"), mock.patch.object(
+            pyappify.os, "kill"
+        ) as kill:
+            result = pyappify._wait_for_process_exit(
+                1234,
+                timeout=30,
+                exit_event=exit_event,
+            )
+
+        self.assertFalse(result)
+        kill.assert_not_called()
 
     def test_show_pyappify_brings_existing_window_to_front(self):
         pyappify.pid = 1234

@@ -84,6 +84,16 @@ class TestAppConfig(unittest.TestCase):
             received[-1],
         )
 
+    def test_watcher_stops_when_exit_event_is_set(self):
+        self.api.stop_watcher()
+        exit_event = threading.Event()
+        thread = self.api.start_watcher(exit_event=exit_event)
+
+        exit_event.set()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+
 
 if __name__ == "__main__":
     unittest.main()

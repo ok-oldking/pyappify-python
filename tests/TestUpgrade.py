@@ -4,9 +4,11 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pyappify
 
@@ -96,6 +98,26 @@ def assert_upgrade_kills_running_executable_and_replaces_it(
 
 class TestUpgrade(unittest.TestCase):
     LOCAL_ZIP = Path(__file__).with_name("ok-ww-win32.zip")
+
+    def test_upgrade_worker_stops_when_exit_event_is_already_set(self):
+        exit_event = threading.Event()
+        exit_event.set()
+
+        with mock.patch.object(
+            pyappify, "pyappify_upgradeable", True
+        ), mock.patch.object(
+            pyappify, "pyappify_version", "v1.0.0"
+        ), mock.patch.object(pyappify.urllib.request, "urlopen") as urlopen:
+            thread = pyappify.upgrade(
+                "v1.0.1",
+                "",
+                ["https://example.invalid/pyappify.zip"],
+                exit_event=exit_event,
+            )
+            thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        urlopen.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "executable replacement test is Windows-only")
     def test_upgrade_from_local_zip_kills_running_executable_and_replaces_it(self):

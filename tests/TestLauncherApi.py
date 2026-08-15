@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -99,6 +100,7 @@ class TestLauncherApi(unittest.TestCase):
                 "true",
             ],
             timeout=120,
+            exit_event=None,
         )
 
     def test_get_version_list_returns_timeout_as_an_error(self):
@@ -110,6 +112,28 @@ class TestLauncherApi(unittest.TestCase):
             with self.assertRaisesRegex(TimeoutError, "Timed out waiting"):
                 pyappify.get_version_list()
 
+    def test_launcher_request_terminates_when_exit_event_is_set(self):
+        exit_event = threading.Event()
+        process = mock.Mock()
+        process.poll.return_value = None
+        pyappify.pyappify_executable = os.path.abspath("pyappify.exe")
+
+        def request_exit(_event, _timeout):
+            exit_event.set()
+            return True
+
+        with mock.patch.object(
+            pyappify.os.path, "isfile", return_value=True
+        ), mock.patch.object(
+            pyappify.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            pyappify, "_wait_for_exit", side_effect=request_exit
+        ):
+            with self.assertRaisesRegex(InterruptedError, "exit_event"):
+                pyappify.get_version_list(exit_event=exit_event)
+
+        process.terminate.assert_called_once_with()
+
     def test_update_to_version_returns_launcher_result(self):
         pyappify.pyappify_executable = os.path.abspath("pyappify.exe")
         with mock.patch.object(pyappify.os.path, "isfile", return_value=True), mock.patch.object(
@@ -118,7 +142,11 @@ class TestLauncherApi(unittest.TestCase):
             result = pyappify.update_to_version("v2.0.0")
 
         self.assertEqual({"updated": True, "version": "v2.0.0"}, result)
-        run.assert_called_once_with(["--update-to-version", "v2.0.0"], timeout=300)
+        run.assert_called_once_with(
+            ["--update-to-version", "v2.0.0"],
+            timeout=300,
+            exit_event=None,
+        )
 
     def test_calculate_update_notes_returns_inclusive_descending_range(self):
         versions = [

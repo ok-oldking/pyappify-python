@@ -44,6 +44,7 @@ app_json_path = configure_app_json(os.environ.get("PYAPPIFY_APP_JSON_PATH"))
 pyappify_upgradeable = os.environ.get("PYAPPIFY_UPGRADEABLE") == '1'
 logger = None
 _console_logger = None
+_DOWNLOAD_IO_TIMEOUT_SECONDS = 2
 
 try:
     pid = int(os.environ.get("PYAPPIFY_PID"))
@@ -139,13 +140,13 @@ def bring_window_to_front_by_pid(pid):
     return False
 
 
-def kill_pyappify(timeout=30):
+def kill_pyappify(timeout=30, exit_event=None):
     if pid:
         log = _get_logger()
         log.info(f"Attempting to terminate process with PID: {pid}")
         try:
             os.kill(pid, signal.SIGTERM)
-            if not _wait_for_process_exit(pid, timeout):
+            if not _wait_for_process_exit(pid, timeout, exit_event=exit_event):
                 log.warning(f"Timed out waiting for process with PID {pid} to exit.")
                 return False
             log.info(f'_wait_for_process_exit success {pid}')
@@ -156,11 +157,11 @@ def kill_pyappify(timeout=30):
     return False
 
 
-def kill_pyappify_exe(timeout=30):
-    return kill_pyappify(timeout)
+def kill_pyappify_exe(timeout=30, exit_event=None):
+    return kill_pyappify(timeout, exit_event=exit_event)
 
 
-def _wait_for_process_exit(process_pid, timeout=30):
+def _wait_for_process_exit(process_pid, timeout=30, exit_event=None):
     if sys.platform == "win32" and ctypes:
         synchronize = 0x00100000
         wait_timeout = 0x00000102
@@ -181,22 +182,32 @@ def _wait_for_process_exit(process_pid, timeout=30):
         handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, process_pid)
         if handle:
             try:
-                result = ctypes.windll.kernel32.WaitForSingleObject(
-                    handle, int(timeout * 1000)
-                )
-                if result == wait_failed:
-                    return False
-                return result != wait_timeout
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    if _exit_requested(exit_event):
+                        return False
+                    remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+                    result = ctypes.windll.kernel32.WaitForSingleObject(
+                        handle, min(100, remaining_ms)
+                    )
+                    if result == wait_failed:
+                        return False
+                    if result != wait_timeout:
+                        return True
+                return False
             finally:
                 ctypes.windll.kernel32.CloseHandle(handle)
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if _exit_requested(exit_event):
+            return False
         try:
             os.kill(process_pid, 0)
         except OSError:
             return True
-        time.sleep(0.1)
+        if _wait_for_exit(exit_event, 0.1):
+            return False
     return False
 
 
@@ -285,7 +296,32 @@ def _require_pyappify_executable():
     return pyappify_executable
 
 
-def _run_launcher_api(arguments, timeout=300):
+def _exit_requested(*events):
+    return any(event is not None and event.is_set() for event in events)
+
+
+def _wait_for_exit(exit_event, timeout):
+    if exit_event is not None:
+        return exit_event.wait(timeout)
+    time.sleep(timeout)
+    return False
+
+
+def _raise_if_exit_requested(exit_event):
+    if _exit_requested(exit_event):
+        raise InterruptedError("PyAppify operation cancelled because exit_event was set")
+
+
+def _terminate_process(process):
+    try:
+        if process.poll() is None:
+            process.terminate()
+    except (AttributeError, OSError):
+        pass
+
+
+def _run_launcher_api(arguments, timeout=300, exit_event=None):
+    _raise_if_exit_requested(exit_event)
     executable = _require_pyappify_executable()
     response_path = os.path.join(
         tempfile.gettempdir(),
@@ -293,7 +329,7 @@ def _run_launcher_api(arguments, timeout=300):
     )
     command = list(arguments) + ["--response-file", response_path]
     try:
-        subprocess.Popen(
+        process = subprocess.Popen(
             [executable] + command,
             cwd=os.path.dirname(executable) or None,
             stdout=subprocess.DEVNULL,
@@ -305,8 +341,13 @@ def _run_launcher_api(arguments, timeout=300):
         )
 
     deadline = time.monotonic() + timeout
+    cancelled = False
     try:
         while time.monotonic() < deadline:
+            if _exit_requested(exit_event):
+                cancelled = True
+                _terminate_process(process)
+                break
             try:
                 with open(response_path, "r", encoding="utf-8") as response_file:
                     response = json.load(response_file)
@@ -318,18 +359,25 @@ def _run_launcher_api(arguments, timeout=300):
             except json.JSONDecodeError:
                 # The running launcher may still be completing the response write.
                 pass
-            time.sleep(0.05)
+            if _wait_for_exit(exit_event, 0.05):
+                cancelled = True
+                _terminate_process(process)
+                break
     finally:
         try:
             os.remove(response_path)
         except FileNotFoundError:
             pass
 
+    if cancelled:
+        raise InterruptedError("PyAppify operation cancelled because exit_event was set")
     raise TimeoutError("Timed out waiting for a response from PyAppify")
 
 
-def get_version_list(number_versions=10, release_only=True, timeout=120):
-    """Return the latest versions and each version's notes since its predecessor."""
+def get_version_list(
+    number_versions=10, release_only=True, timeout=120, exit_event=None
+):
+    """Return version details, cancelling with InterruptedError on exit_event."""
     if isinstance(number_versions, bool) or not isinstance(number_versions, int):
         raise TypeError("number_versions must be an integer")
     if number_versions <= 0:
@@ -338,7 +386,8 @@ def get_version_list(number_versions=10, release_only=True, timeout=120):
         raise TypeError("release_only must be a boolean")
 
     if "PYAPPIFY_PYTHON_TEST" in os.environ:
-        time.sleep(5)
+        if _wait_for_exit(exit_event, 5):
+            _raise_if_exit_requested(exit_event)
         return _get_mock_version_list(number_versions)
 
     response = _run_launcher_api(
@@ -350,15 +399,16 @@ def get_version_list(number_versions=10, release_only=True, timeout=120):
             str(release_only).lower(),
         ],
         timeout=timeout,
+        exit_event=exit_event,
     )
     if not isinstance(response, list):
         raise RuntimeError("PyAppify returned an invalid version-list response")
     return response
 
 
-def get_versions(number_versions=10, release_only=True, timeout=120):
+def get_versions(number_versions=10, release_only=True, timeout=120, exit_event=None):
     """Alias for get_version_list."""
-    return get_version_list(number_versions, release_only, timeout)
+    return get_version_list(number_versions, release_only, timeout, exit_event)
 
 
 def calculate_update_notes(update_notes, current_version, target_version):
@@ -401,15 +451,17 @@ def calculate_update_notes(update_notes, current_version, target_version):
     return [str(note) for note in notes]
 
 
-def update_to_version(version, timeout=300):
-    """Start PyAppify (or forward to it) and update the managed app to version."""
+def update_to_version(version, timeout=300, exit_event=None):
+    """Update the app, cancelling with InterruptedError on exit_event."""
     if not isinstance(version, str) or not version.strip():
         raise ValueError("version must be a non-empty string")
     if "PYAPPIFY_PYTHON_TEST" in os.environ:
+        _raise_if_exit_requested(exit_event)
         return {"updated": True, "version": version, "mocked": True}
     response = _run_launcher_api(
         ["--update-to-version", version],
         timeout=timeout,
+        exit_event=exit_event,
     )
     if not isinstance(response, dict) or not response.get("updated"):
         raise RuntimeError("PyAppify returned an invalid update response")
@@ -463,10 +515,11 @@ def _get_mock_version_list(number_versions):
     return versions[:number_versions]
 
 
-def _replace_executable(source_path, target_path, timeout=30):
+def _replace_executable(source_path, target_path, timeout=30, exit_event=None):
     deadline = time.monotonic() + timeout
     last_error = None
     while True:
+        _raise_if_exit_requested(exit_event)
         try:
             shutil.move(source_path, target_path)
             return
@@ -474,7 +527,8 @@ def _replace_executable(source_path, target_path, timeout=30):
             last_error = e
             if time.monotonic() >= deadline:
                 raise last_error
-            time.sleep(0.25)
+            if _wait_for_exit(exit_event, 0.25):
+                _raise_if_exit_requested(exit_event)
 
 
 def hide_pyappify():
@@ -487,7 +541,13 @@ def hide_pyappify():
             log.error(f"Failed to minimize window for process with PID {pid}: {e}")
             pass
 
-def upgrade(to_version, executable_sha256, executable_zip_urls, stop_event=None):
+def upgrade(
+    to_version,
+    executable_sha256,
+    executable_zip_urls,
+    stop_event=None,
+    exit_event=None,
+):
     log = _get_logger()
     if not pyappify_upgradeable or not is_greater_version(to_version, pyappify_version):
         log.info(f"pyappify no need to upgrade {pyappify_upgradeable} {to_version} {executable_sha256} {executable_zip_urls}")
@@ -497,17 +557,23 @@ def upgrade(to_version, executable_sha256, executable_zip_urls, stop_event=None)
     def _do_upgrade():
         tmp_dir = os.path.join(os.getcwd(), "pyappify_tmp")
         try:
+            if _exit_requested(stop_event, exit_event):
+                return
             os.makedirs(tmp_dir, exist_ok=True)
             downloaded_zip_path = None
             for url in executable_zip_urls:
+                if _exit_requested(stop_event, exit_event):
+                    return
                 try:
                     log.info(
                         f"pyappify start to download {url}")
                     local_zip_path = os.path.join(tmp_dir, os.path.basename(url))
-                    with urllib.request.urlopen(url) as response, open(local_zip_path, 'wb') as out_file:
+                    with urllib.request.urlopen(
+                        url, timeout=_DOWNLOAD_IO_TIMEOUT_SECONDS
+                    ) as response, open(local_zip_path, 'wb') as out_file:
                         while True:
-                            if stop_event and stop_event.is_set():
-                                log.info("pyappify Upgrade download cancelled by stop event.")
+                            if _exit_requested(stop_event, exit_event):
+                                log.info("pyappify Upgrade download cancelled.")
                                 return
                             chunk = response.read(8192)
                             if not chunk:
@@ -526,11 +592,16 @@ def upgrade(to_version, executable_sha256, executable_zip_urls, stop_event=None)
                 return
 
             with zipfile.ZipFile(downloaded_zip_path, 'r') as zip_ref:
-                zip_ref.extractall(tmp_dir)
+                for member in zip_ref.infolist():
+                    if _exit_requested(stop_event, exit_event):
+                        return
+                    zip_ref.extract(member, tmp_dir)
 
             new_executable_name = os.path.basename(pyappify_executable)
             found_executable_path = None
             for root, _, files in os.walk(tmp_dir):
+                if _exit_requested(stop_event, exit_event):
+                    return
                 if new_executable_name in files:
                     found_executable_path = os.path.join(root, new_executable_name)
                     break
@@ -541,15 +612,26 @@ def upgrade(to_version, executable_sha256, executable_zip_urls, stop_event=None)
 
             sha256_hash = hashlib.sha256()
             with open(found_executable_path, "rb") as f:
-                for byte_block in iter(lambda: f.read(4096), b""):
+                while True:
+                    if _exit_requested(stop_event, exit_event):
+                        return
+                    byte_block = f.read(4096)
+                    if not byte_block:
+                        break
                     sha256_hash.update(byte_block)
 
             if executable_sha256 and sha256_hash.hexdigest() != executable_sha256:
                 log.error("pyappify SHA256 checksum mismatch.")
                 return
 
-            kill_pyappify()
-            _replace_executable(found_executable_path, pyappify_executable)
+            if _exit_requested(stop_event, exit_event):
+                return
+            kill_pyappify(exit_event=exit_event or stop_event)
+            _replace_executable(
+                found_executable_path,
+                pyappify_executable,
+                exit_event=exit_event or stop_event,
+            )
             log.info(f"pyappify Upgrade success")
         except Exception as e:
             log.error(f"pyappify Upgrade failed: {e}")
@@ -560,6 +642,7 @@ def upgrade(to_version, executable_sha256, executable_zip_urls, stop_event=None)
     thread = threading.Thread(target=_do_upgrade)
     thread.daemon = True
     thread.start()
+    return thread
 
 
 def is_app_updated():
