@@ -10,6 +10,10 @@ import urllib.request
 import zipfile
 import threading
 import time
+import tempfile
+import uuid
+import sys
+from pathlib import Path
 
 from .app_config import (
     UPDATE_METHOD_AUTO,
@@ -35,7 +39,6 @@ update_note = os.environ.get("PYAPPIFY_UPDATE_NOTE")
 app_profile = os.environ.get("PYAPPIFY_APP_PROFILE")
 app_locale = os.environ.get("PYAPPIFY_LOCALE") or "en"
 pyappify_version = os.environ.get("PYAPPIFY_VERSION")
-pyappify_executable = os.environ.get("PYAPPIFY_EXECUTABLE")
 app_json_path = configure_app_json(os.environ.get("PYAPPIFY_APP_JSON_PATH"))
 
 pyappify_upgradeable = os.environ.get("PYAPPIFY_UPGRADEABLE") == '1'
@@ -47,12 +50,39 @@ try:
 except (ValueError, TypeError):
     pid = None
 
-import sys
-
 try:
     import ctypes
 except ImportError:
     ctypes = None
+
+
+def find_pyappify_executable(start_dir=None, environ=None):
+    """Find the launcher configured by PyAppify or in a parent directory."""
+    environ = os.environ if environ is None else environ
+    configured = environ.get("PYAPPIFY_EXECUTABLE")
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if configured_path.is_file():
+            return str(configured_path.resolve())
+
+    current = Path(start_dir or os.getcwd()).expanduser()
+    if current.is_file():
+        current = current.parent
+    try:
+        current = current.resolve()
+    except OSError:
+        current = current.absolute()
+
+    executable_names = ("pyappify.exe", "pyappify")
+    for directory in (current,) + tuple(current.parents):
+        for executable_name in executable_names:
+            candidate = directory / executable_name
+            if candidate.is_file():
+                return str(candidate.resolve())
+    return None
+
+
+pyappify_executable = find_pyappify_executable()
 
 
 def _get_logger():
@@ -209,16 +239,18 @@ def show_pyappify(args=None, cwd=None, env=None):
     global pid
 
     log = _get_logger()
-    if _is_process_running(pid):
+    already_running = _is_process_running(pid)
+    if already_running and not args:
         log.info(f"PyAppify is already running with PID: {pid}")
         bring_window_to_front_by_pid(pid)
         return pid
 
-    if not pyappify_executable:
-        log.error("PYAPPIFY_EXECUTABLE is not configured.")
+    executable = pyappify_executable or find_pyappify_executable()
+    if not executable:
+        log.error("PyAppify executable was not found.")
         return None
 
-    command = [pyappify_executable]
+    command = [executable]
     if args:
         if isinstance(args, str):
             command.append(args)
@@ -228,14 +260,114 @@ def show_pyappify(args=None, cwd=None, env=None):
     try:
         process = subprocess.Popen(
             command,
-            cwd=cwd or os.path.dirname(pyappify_executable) or None,
+            cwd=cwd or os.path.dirname(executable) or None,
             env=env,
         )
-        pid = process.pid
+        if not already_running:
+            pid = process.pid
         return pid
     except Exception as e:
-        log.error(f"Failed to start PyAppify executable {pyappify_executable}: {e}")
+        log.error(f"Failed to start PyAppify executable {executable}: {e}")
         return None
+
+
+def _require_pyappify_executable():
+    global pyappify_executable
+
+    if pyappify_executable and os.path.isfile(pyappify_executable):
+        return os.path.abspath(pyappify_executable)
+    pyappify_executable = find_pyappify_executable()
+    if not pyappify_executable:
+        raise FileNotFoundError(
+            "PyAppify executable was not found. Set PYAPPIFY_EXECUTABLE to an "
+            "existing executable or place pyappify.exe in this directory or a parent directory."
+        )
+    return pyappify_executable
+
+
+def _run_launcher_api(arguments, timeout=300):
+    executable = _require_pyappify_executable()
+    response_path = os.path.join(
+        tempfile.gettempdir(),
+        "pyappify-response-{}-{}.json".format(os.getpid(), uuid.uuid4().hex),
+    )
+    command = list(arguments) + ["--response-file", response_path]
+    try:
+        subprocess.Popen(
+            [executable] + command,
+            cwd=os.path.dirname(executable) or None,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        raise RuntimeError(
+            "Failed to execute PyAppify at '{}': {}".format(executable, error)
+        )
+
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            try:
+                with open(response_path, "r", encoding="utf-8") as response_file:
+                    response = json.load(response_file)
+                if isinstance(response, dict) and response.get("error"):
+                    raise RuntimeError(response["error"])
+                return response
+            except FileNotFoundError:
+                pass
+            except json.JSONDecodeError:
+                # The running launcher may still be completing the response write.
+                pass
+            time.sleep(0.05)
+    finally:
+        try:
+            os.remove(response_path)
+        except FileNotFoundError:
+            pass
+
+    raise TimeoutError("Timed out waiting for a response from PyAppify")
+
+
+def get_version_list(number_versions=10, release_only=True, timeout=300):
+    """Return the latest versions and each version's notes since its predecessor."""
+    if isinstance(number_versions, bool) or not isinstance(number_versions, int):
+        raise TypeError("number_versions must be an integer")
+    if number_versions <= 0:
+        raise ValueError("number_versions must be greater than zero")
+    if not isinstance(release_only, bool):
+        raise TypeError("release_only must be a boolean")
+
+    response = _run_launcher_api(
+        [
+            "--get-version-list",
+            "--number-versions",
+            str(number_versions),
+            "--release-only",
+            str(release_only).lower(),
+        ],
+        timeout=timeout,
+    )
+    if not isinstance(response, list):
+        raise RuntimeError("PyAppify returned an invalid version-list response")
+    return response
+
+
+def get_versions(number_versions=10, release_only=True, timeout=300):
+    """Alias for get_version_list."""
+    return get_version_list(number_versions, release_only, timeout)
+
+
+def update_to_version(version, timeout=300):
+    """Start PyAppify (or forward to it) and update the managed app to version."""
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("version must be a non-empty string")
+    response = _run_launcher_api(
+        ["--update-to-version", version],
+        timeout=timeout,
+    )
+    if not isinstance(response, dict) or not response.get("updated"):
+        raise RuntimeError("PyAppify returned an invalid update response")
+    return response
 
 
 def _replace_executable(source_path, target_path, timeout=30):
