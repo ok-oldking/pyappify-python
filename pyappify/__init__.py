@@ -412,6 +412,12 @@ def get_version_list(
     if not isinstance(release_only, bool):
         raise TypeError("release_only must be a boolean")
 
+    if not pyappify_version or is_greater_version("1.2.2", pyappify_version):
+        raise RuntimeError(
+            "PyAppify does not support checking for updates for "
+            f"pyappify_version: {pyappify_version}"
+        )
+
     if "PYAPPIFY_PYTHON_TEST" in os.environ:
         if _wait_for_exit(exit_event, 5):
             _raise_if_exit_requested(exit_event)
