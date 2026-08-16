@@ -93,7 +93,7 @@ def find_pyappify_executable(start_dir=None, environ=None):
         return None
 
     app_root = data_directory.parent
-    exact_launcher_name = "{} Launcher.exe".format(app_name).casefold()
+    executable_name = "{}.exe".format(app_name)
     search_directories = []
     directory = working_directory
     while True:
@@ -103,24 +103,9 @@ def find_pyappify_executable(start_dir=None, environ=None):
         directory = directory.parent
 
     for directory in search_directories:
-        try:
-            candidates = [
-                candidate
-                for candidate in directory.iterdir()
-                if candidate.is_file()
-                and candidate.suffix.casefold() == ".exe"
-                and candidate.name.casefold().startswith(app_name.casefold())
-            ]
-        except OSError:
-            continue
-        if candidates:
-            candidates.sort(
-                key=lambda candidate: (
-                    candidate.name.casefold() != exact_launcher_name,
-                    candidate.name.casefold(),
-                )
-            )
-            return str(candidates[0].resolve())
+        candidate = directory / executable_name
+        if candidate.is_file():
+            return str(candidate.resolve())
     return None
 
 
@@ -332,8 +317,8 @@ def _require_pyappify_executable():
     if not pyappify_executable:
         raise FileNotFoundError(
             "PyAppify executable was not found. Set PYAPPIFY_EXECUTABLE to an "
-            "existing executable or place an executable whose name starts with the app name "
-            "in the working directory or a parent directory."
+            "existing executable or place <app_name>.exe between the working directory "
+            "and the app root."
         )
     return pyappify_executable
 
