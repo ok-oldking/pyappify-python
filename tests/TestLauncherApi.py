@@ -39,6 +39,16 @@ class TestLauncherApi(unittest.TestCase):
 
         run.assert_not_called()
 
+    def test_get_version_list_rejects_malformed_pyappify_version_without_calling_launcher(self):
+        pyappify.pyappify_version = "v1.x.2"
+        with mock.patch.object(pyappify, "_run_launcher_api") as run:
+            with self.assertRaisesRegex(
+                RuntimeError, r"does not support checking for updates.*v1\.x\.2"
+            ):
+                pyappify.get_version_list()
+
+        run.assert_not_called()
+
     def test_finds_configured_executable_before_ancestor_fallback(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
