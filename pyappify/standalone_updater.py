@@ -13,7 +13,9 @@ is appended to ``.git/pyappify/update.log``. Steps:
 3. ``pip install`` the profile's requirements if they changed;
 4. on failure, check out the previous commit again;
 5. restart the app, with ``PYAPPIFY_APP_VERSION``, ``PYAPPIFY_APP_STARTING_VERSION``
-   and ``PYAPPIFY_UPDATE_NOTE`` set after a successful update.
+   and ``PYAPPIFY_UPDATE_NOTE`` set after a successful update;
+6. on Windows, refresh the Start Menu shortcut (and the Desktop one if it
+   exists), as the launcher does.
 
 On success the window closes after a few seconds; on failure it stays open
 until the user presses Enter.
@@ -26,7 +28,7 @@ import subprocess
 import sys
 import time
 
-from . import _process, standalone
+from . import _process, shortcut, standalone
 
 SUCCESS_CLOSE_DELAY_SECONDS = 3
 APP_STOP_TIMEOUT_SECONDS = 15
@@ -84,8 +86,30 @@ def run_job(job, log):
         "PYAPPIFY_APP_STARTING_VERSION": job.get("previous_version") or version,
         "PYAPPIFY_UPDATE_NOTE": json.dumps(update_note, ensure_ascii=False) if update_note else "",
     }, log)
+    refresh_shortcuts(job, log)
     log.info("Updated to %s.", version)
     return True
+
+
+def refresh_shortcuts(job, log):
+    """Refresh the app's shortcuts as the launcher does; failures are only logged."""
+    relaunch_info = job.get("relaunch") or {}
+    argv = relaunch_info.get("argv")
+    if os.name != "nt" or not argv or not job.get("refresh_shortcuts"):
+        return []
+    try:
+        paths = shortcut.refresh_shortcuts(
+            target=argv[0],
+            arguments=argv[1:],
+            working_dir=relaunch_info.get("cwd") or job["repo_path"],
+            profile=job.get("profile") or "",
+        )
+    except Exception as error:
+        log.warning("Could not refresh the app's shortcuts: %s", error)
+        return []
+    for path in paths:
+        log.info("Refreshed shortcut %s", path)
+    return paths
 
 
 def stop_app(pid, grace_seconds, log):

@@ -322,11 +322,13 @@ def _parse_scalar(value):
     return value.split(" #", 1)[0].rstrip()
 
 
-def _parse_profiles_without_yaml(text):
-    """Read ``profiles`` from pyappify.yml when PyYAML is not installed.
+def _parse_app_config_without_yaml(text):
+    """Read pyappify.yml when PyYAML is not installed.
 
-    Only the flat ``key: value`` profile entries the launcher reads are supported.
+    Only what the launcher reads is supported: top-level ``key: value`` scalars
+    and a ``profiles`` list of flat ``key: value`` entries.
     """
+    config = {}
     profiles = []
     in_profiles = False
     profile_indent = None
@@ -336,7 +338,11 @@ def _parse_profiles_without_yaml(text):
             continue
         indent = len(raw_line) - len(raw_line.lstrip())
         if indent == 0:
-            in_profiles = stripped.split(":", 1)[0].strip() == "profiles"
+            key, _, value = stripped.partition(":")
+            key = key.strip()
+            in_profiles = key == "profiles"
+            if not in_profiles and value.strip():
+                config[key] = _parse_scalar(value)
             continue
         if not in_profiles:
             continue
@@ -351,17 +357,44 @@ def _parse_profiles_without_yaml(text):
         if profiles and ":" in stripped:
             key, value = stripped.split(":", 1)
             profiles[-1][key.strip()] = _parse_scalar(value)
-    return profiles
+    config["profiles"] = profiles
+    return config
 
 
-def parse_profiles(text):
+def parse_app_config(text):
+    """Parse pyappify.yml into a dict whose ``profiles`` is a list of dicts."""
     try:
         import yaml
     except ImportError:
-        return _parse_profiles_without_yaml(text)
+        return _parse_app_config_without_yaml(text)
     document = yaml.safe_load(text) or {}
-    profiles = document.get("profiles") if isinstance(document, dict) else None
-    return [profile for profile in profiles or [] if isinstance(profile, dict)]
+    if not isinstance(document, dict):
+        document = {}
+    profiles = document.get("profiles")
+    document["profiles"] = [
+        profile for profile in profiles if isinstance(profile, dict)
+    ] if isinstance(profiles, list) else []
+    return document
+
+
+def parse_profiles(text):
+    return parse_app_config(text)["profiles"]
+
+
+def select_profile(profiles, profile_name=None):
+    """Return ``profile_name`` (or the first profile), inheriting unset keys from the first.
+
+    Mirrors the launcher's profile inheritance; returns {} without profiles.
+    """
+    if not profiles:
+        return {}
+    first = profiles[0]
+    profile = next(
+        (item for item in profiles if str(item.get("name")) == profile_name), first
+    )
+    merged = dict(first)
+    merged.update({key: value for key, value in profile.items() if value not in (None, "")})
+    return merged
 
 
 def requirements_at(repo, commit_id, profile_name=None):
@@ -374,15 +407,9 @@ def requirements_at(repo, commit_id, profile_name=None):
     spec, pip_args = "", ""
     yml = read_file_at(repo, commit_id, PYAPPIFY_YML)
     if yml is not None:
-        profiles = parse_profiles(yml.decode("utf-8", "replace"))
-        if profiles:
-            first = profiles[0]
-            profile = next(
-                (item for item in profiles if str(item.get("name")) == profile_name),
-                first,
-            )
-            spec = str(profile.get("requirements") or first.get("requirements") or "")
-            pip_args = str(profile.get("pip_args") or first.get("pip_args") or "")
+        profile = select_profile(parse_profiles(yml.decode("utf-8", "replace")), profile_name)
+        spec = str(profile.get("requirements") or "")
+        pip_args = str(profile.get("pip_args") or "")
     elif read_file_at(repo, commit_id, DEFAULT_REQUIREMENTS) is not None:
         spec = DEFAULT_REQUIREMENTS
 
@@ -453,6 +480,7 @@ def update_to_version(
             "cwd": os.getcwd(),
             "pythonpath": os.environ.get("PYTHONPATH"),
         },
+        "refresh_shortcuts": True,
     }
     os.makedirs(job_dir, exist_ok=True)
     job_path = os.path.join(job_dir, JOB_FILE_NAME)

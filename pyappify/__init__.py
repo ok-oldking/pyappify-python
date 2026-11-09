@@ -34,6 +34,7 @@ from .launcher import (
     show_pyappify,
 )
 from .self_upgrade import upgrade
+from .shortcut import create_shortcut, refresh_shortcuts
 from .updates import get_version_list, get_versions, update_to_version
 from .versions import calculate_update_notes, is_greater_version
 

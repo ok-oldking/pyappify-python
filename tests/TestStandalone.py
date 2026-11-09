@@ -74,8 +74,10 @@ class TestVersionTags(unittest.TestCase):
 
 class TestProfileParsing(unittest.TestCase):
     def test_parses_profiles_without_yaml(self):
-        profiles = standalone._parse_profiles_without_yaml(PYAPPIFY_YML)
+        config = standalone._parse_app_config_without_yaml(PYAPPIFY_YML)
+        profiles = config["profiles"]
 
+        self.assertEqual("demo", config["name"])
         self.assertEqual("China", profiles[0]["name"])
         self.assertEqual("requirements.txt", profiles[0]["requirements"])
         self.assertEqual("--no-deps", profiles[0]["pip_args"])
@@ -211,6 +213,7 @@ class TestStandaloneUpdateRequest(StandaloneRepoTestCase):
         self.assertEqual(self.head().decode(), job["previous_commit"])
         self.assertEqual(os.getpid(), job["pid"])
         self.assertEqual(sys.executable, job["relaunch"]["argv"][0])
+        self.assertTrue(job["refresh_shortcuts"])
         self.assertEqual(self.tag_commit("v1.0.0"), self.head(), "the app's files must not change yet")
 
     def test_rejects_unknown_version(self):
