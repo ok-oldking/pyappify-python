@@ -19,6 +19,8 @@ pyappify = "pyappify.main:main"
 
 [project.optional-dependencies]
 dev = ["twine", "build"]
+# Updating a git clone of the app without the PyAppify launcher.
+standalone = ["dulwich>=1.2; python_version >= '3.10'"]
 
 [tool.setuptools.packages.find]
 where = ["."]

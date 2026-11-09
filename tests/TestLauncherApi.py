@@ -21,7 +21,8 @@ class TestLauncherApi(unittest.TestCase):
 
     def test_get_version_list_rejects_missing_pyappify_version_without_calling_launcher(self):
         pyappify.pyappify_version = None
-        with mock.patch.object(pyappify, "_run_launcher_api") as run:
+        pyappify.pyappify_executable = os.path.abspath("pyappify.exe")
+        with mock.patch.object(pyappify.launcher, "_run_launcher_api") as run:
             with self.assertRaisesRegex(
                 RuntimeError, r"does not support checking for updates.*None"
             ):
@@ -31,7 +32,7 @@ class TestLauncherApi(unittest.TestCase):
 
     def test_get_version_list_rejects_old_pyappify_version_without_calling_launcher(self):
         pyappify.pyappify_version = "v1.2.1"
-        with mock.patch.object(pyappify, "_run_launcher_api") as run:
+        with mock.patch.object(pyappify.launcher, "_run_launcher_api") as run:
             with self.assertRaisesRegex(
                 RuntimeError, r"does not support checking for updates.*v1\.2\.1"
             ):
@@ -41,7 +42,7 @@ class TestLauncherApi(unittest.TestCase):
 
     def test_get_version_list_rejects_malformed_pyappify_version_without_calling_launcher(self):
         pyappify.pyappify_version = "v1.x.2"
-        with mock.patch.object(pyappify, "_run_launcher_api") as run:
+        with mock.patch.object(pyappify.launcher, "_run_launcher_api") as run:
             with self.assertRaisesRegex(
                 RuntimeError, r"does not support checking for updates.*v1\.x\.2"
             ):
@@ -143,7 +144,7 @@ class TestLauncherApi(unittest.TestCase):
 
     def test_missing_executable_raises_a_clear_error(self):
         pyappify.pyappify_executable = None
-        with mock.patch.object(pyappify, "find_pyappify_executable", return_value=None):
+        with mock.patch.object(pyappify.launcher, "find_pyappify_executable", return_value=None):
             with self.assertRaises(FileNotFoundError):
                 pyappify.get_version_list()
 
@@ -167,7 +168,7 @@ class TestLauncherApi(unittest.TestCase):
                 return mock.Mock(pid=1234)
 
             with mock.patch.object(
-                pyappify.subprocess, "Popen", side_effect=write_response
+                pyappify.launcher.subprocess, "Popen", side_effect=write_response
             ) as popen:
                 actual = pyappify.get_version_list(4, release_only=False, timeout=1)
 
@@ -181,7 +182,7 @@ class TestLauncherApi(unittest.TestCase):
 
     def test_get_version_list_has_a_two_minute_default_timeout(self):
         with mock.patch.object(
-            pyappify, "_run_launcher_api", return_value=[]
+            pyappify.launcher, "_run_launcher_api", return_value=[]
         ) as run:
             result = pyappify.get_version_list()
 
@@ -200,7 +201,7 @@ class TestLauncherApi(unittest.TestCase):
 
     def test_get_version_list_returns_timeout_as_an_error(self):
         with mock.patch.object(
-            pyappify,
+            pyappify.launcher,
             "_run_launcher_api",
             side_effect=TimeoutError("Timed out waiting for a response from PyAppify"),
         ):
@@ -220,9 +221,9 @@ class TestLauncherApi(unittest.TestCase):
         with mock.patch.object(
             pyappify.os.path, "isfile", return_value=True
         ), mock.patch.object(
-            pyappify.subprocess, "Popen", return_value=process
+            pyappify.launcher.subprocess, "Popen", return_value=process
         ), mock.patch.object(
-            pyappify, "_wait_for_exit", side_effect=request_exit
+            pyappify._process, "_wait_for_exit", side_effect=request_exit
         ):
             with self.assertRaisesRegex(InterruptedError, "exit_event"):
                 pyappify.get_version_list(exit_event=exit_event)
@@ -232,7 +233,7 @@ class TestLauncherApi(unittest.TestCase):
     def test_update_to_version_returns_launcher_result(self):
         pyappify.pyappify_executable = os.path.abspath("pyappify.exe")
         with mock.patch.object(pyappify.os.path, "isfile", return_value=True), mock.patch.object(
-            pyappify, "_run_launcher_api", return_value={"updated": True, "version": "v2.0.0"}
+            pyappify.launcher, "_run_launcher_api", return_value={"updated": True, "version": "v2.0.0"}
         ) as run:
             result = pyappify.update_to_version("v2.0.0")
 
@@ -271,8 +272,8 @@ class TestLauncherApi(unittest.TestCase):
             os.environ,
             {"PYAPPIFY_PYTHON_TEST": "1"},
         ), mock.patch.object(pyappify, "app_version", "v1.2.3"), mock.patch.object(
-            pyappify, "_run_launcher_api"
-        ) as run, mock.patch.object(pyappify.time, "sleep") as sleep:
+            pyappify.launcher, "_run_launcher_api"
+        ) as run, mock.patch.object(pyappify._process.time, "sleep") as sleep:
             versions = pyappify.get_version_list(3)
             result = pyappify.update_to_version("v1.2.4")
 

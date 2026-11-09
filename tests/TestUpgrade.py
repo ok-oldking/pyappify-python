@@ -107,7 +107,7 @@ class TestUpgrade(unittest.TestCase):
             pyappify, "pyappify_upgradeable", True
         ), mock.patch.object(
             pyappify, "pyappify_version", "v1.0.0"
-        ), mock.patch.object(pyappify.urllib.request, "urlopen") as urlopen:
+        ), mock.patch.object(pyappify.self_upgrade.urllib.request, "urlopen") as urlopen:
             thread = pyappify.upgrade(
                 "v1.0.1",
                 "",

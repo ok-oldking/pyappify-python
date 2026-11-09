@@ -1,6 +1,7 @@
 import importlib
 import os
 import unittest
+from unittest import mock
 
 import pyappify
 
@@ -17,6 +18,10 @@ ENV_KEYS = (
 class TestUpdateEnv(unittest.TestCase):
     def setUp(self):
         self._saved_env = {key: os.environ.get(key) for key in ENV_KEYS}
+        # This checkout's HEAD may carry a version tag; keep these tests about the env.
+        detect = mock.patch.object(pyappify.standalone, "detect_app_version", return_value=None)
+        detect.start()
+        self.addCleanup(detect.stop)
 
     def tearDown(self):
         for key, value in self._saved_env.items():
@@ -90,6 +95,20 @@ class TestUpdateEnv(unittest.TestCase):
             [],
             self._reload_with_env(PYAPPIFY_UPDATE_NOTE='"single note"').get_update_notes(),
         )
+
+    def test_without_launcher_uses_version_tag_of_the_checkout(self):
+        pyappify.standalone.detect_app_version.return_value = "v1.4.0"
+        old_executable = os.environ.pop("PYAPPIFY_EXECUTABLE", None)
+        self.addCleanup(
+            lambda: old_executable is not None
+            and os.environ.__setitem__("PYAPPIFY_EXECUTABLE", old_executable)
+        )
+
+        module = self._reload_with_env()
+
+        self.assertEqual("v1.4.0", module.app_version)
+        self.assertEqual("v1.4.0", module.app_starting_version)
+        self.assertFalse(module.is_app_updated())
 
     def test_reads_locale_with_english_fallback(self):
         self.assertEqual("zh-CN", self._reload_with_env(PYAPPIFY_LOCALE="zh-CN").get_locale())

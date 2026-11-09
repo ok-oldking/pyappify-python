@@ -22,8 +22,8 @@ class TestProcessControls(unittest.TestCase):
     def test_kill_pyappify_exe_terminates_configured_pid(self):
         pyappify.pid = 1234
 
-        with mock.patch.object(pyappify.os, "kill") as kill, mock.patch.object(
-            pyappify, "_wait_for_process_exit", return_value=True
+        with mock.patch.object(pyappify.launcher.os, "kill") as kill, mock.patch.object(
+            pyappify._process, "_wait_for_process_exit", return_value=True
         ) as wait:
             self.assertTrue(pyappify.kill_pyappify_exe(timeout=5))
 
@@ -34,10 +34,10 @@ class TestProcessControls(unittest.TestCase):
         exit_event = threading.Event()
         exit_event.set()
 
-        with mock.patch.object(pyappify.sys, "platform", "linux"), mock.patch.object(
-            pyappify.os, "kill"
+        with mock.patch.object(pyappify._process.sys, "platform", "linux"), mock.patch.object(
+            pyappify._process.os, "kill"
         ) as kill:
-            result = pyappify._wait_for_process_exit(
+            result = pyappify._process._wait_for_process_exit(
                 1234,
                 timeout=30,
                 exit_event=exit_event,
@@ -50,10 +50,10 @@ class TestProcessControls(unittest.TestCase):
         pyappify.pid = 1234
 
         with mock.patch.object(
-            pyappify, "_is_process_running", return_value=True
+            pyappify._process, "_is_process_running", return_value=True
         ) as is_running, mock.patch.object(
-            pyappify, "bring_window_to_front_by_pid", return_value=True
-        ) as bring_to_front, mock.patch.object(pyappify.subprocess, "Popen") as popen:
+            pyappify._process, "bring_window_to_front_by_pid", return_value=True
+        ) as bring_to_front, mock.patch.object(pyappify.launcher.subprocess, "Popen") as popen:
             self.assertEqual(1234, pyappify.show_pyappify())
 
         is_running.assert_called_once_with(1234)
@@ -68,8 +68,8 @@ class TestProcessControls(unittest.TestCase):
         process.pid = 5678
 
         with mock.patch.object(
-            pyappify, "_is_process_running", return_value=False
-        ), mock.patch.object(pyappify.subprocess, "Popen", return_value=process) as popen:
+            pyappify._process, "_is_process_running", return_value=False
+        ), mock.patch.object(pyappify.launcher.subprocess, "Popen", return_value=process) as popen:
             self.assertEqual(
                 5678,
                 pyappify.show_pyappify(args=["--profile", "dev"]),
@@ -86,7 +86,7 @@ class TestProcessControls(unittest.TestCase):
         pyappify.pid = None
         pyappify.pyappify_executable = None
 
-        with mock.patch.object(pyappify, "_is_process_running", return_value=False):
+        with mock.patch.object(pyappify._process, "_is_process_running", return_value=False):
             self.assertIsNone(pyappify.show_pyappify())
 
 
