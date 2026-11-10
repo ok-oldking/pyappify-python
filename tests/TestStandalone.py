@@ -365,5 +365,157 @@ class TestStandaloneUpdater(StandaloneRepoTestCase):
         )
 
 
+def copy_without_git(source, destination):
+    """What older launchers did: copy the clone's files into ``working``."""
+    shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".git"))
+
+
+class TestLauncherLayout(StandaloneRepoTestCase):
+    """``<app>/repo`` (git data) and ``<app>/working`` (the app's files)."""
+
+    def setUp(self):
+        super().setUp()
+        self.app = os.path.join(self.root, "app")
+        self.repo = os.path.join(self.app, "repo")
+        self.working = os.path.join(self.app, "working")
+        os.environ.pop("PYAPPIFY_REPO_PATH")
+
+    def make_bare_layout(self):
+        """The current launcher's layout, checked out at v1.0.0."""
+        git(self.root, "clone", "-q", "--bare", self.remote, self.repo)
+        os.makedirs(self.working)
+        git(self.root, "--git-dir", self.repo, "--work-tree", self.working, "checkout", "-q", "-f", "v1.0.0")
+
+    def make_old_layout(self):
+        """An older launcher's layout: a full clone copied into ``working``."""
+        git(self.root, "clone", "-q", self.remote, self.repo)
+        git(self.repo, "checkout", "-q", "v1.0.0")
+        copy_without_git(self.repo, self.working)
+
+    def run_update(self, version="v1.1.0"):
+        job = {
+            "repo_path": self.repo,
+            "version": version,
+            "previous_version": "v1.0.0",
+            "previous_commit": self.layout_head().decode(),
+            "update_note": [],
+            "profile": "Global",
+            "pid": None,
+            "relaunch": {"argv": None, "cwd": self.working, "pythonpath": None},
+        }
+        log = mock.Mock()
+        with mock.patch.object(standalone_updater, "pip_install") as pip, \
+                mock.patch.object(standalone_updater, "relaunch"):
+            succeeded = standalone_updater.run_job(job, log)
+        self.assertTrue(succeeded, log.error.call_args_list)
+        return succeeded, pip
+
+    def layout_head(self):
+        with standalone.open_repo(self.repo) as repo:
+            return repo.head()
+
+    def add_app_files(self):
+        write(os.path.join(self.working, "settings.json"), "{}")
+        write(os.path.join(self.working, "configs", "user.json"), "{}")
+
+    def assert_updated_with_app_files_kept(self):
+        self.assertEqual("1.1.0\n", read(os.path.join(self.working, "app.txt")))
+        self.assertEqual("side\n", read(os.path.join(self.working, "side.txt")))
+        self.assertEqual("{}", read(os.path.join(self.working, "settings.json")))
+        self.assertEqual("{}", read(os.path.join(self.working, "configs", "user.json")))
+        self.assertTrue(standalone.is_bare_repo(self.repo))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "app.txt")), "repo keeps git data only")
+        self.assertFalse(os.path.exists(os.path.join(self.working, ".git")))
+        with standalone.open_repo(self.repo) as repo:
+            self.assertEqual("v1.1.0", standalone.head_version(repo))
+
+    def test_finds_repo_from_inside_working(self):
+        self.make_bare_layout()
+        os.makedirs(os.path.join(self.working, "logs"))
+
+        self.assertEqual(self.repo, standalone.find_repo_path(os.path.join(self.working, "logs"), environ={}))
+        self.assertEqual("v1.0.0", standalone.detect_app_version(self.working))
+        self.assertEqual(self.working, standalone.app_files_dir(self.repo))
+
+    def test_update_checks_out_into_working_and_keeps_app_files(self):
+        self.make_bare_layout()
+        self.add_app_files()
+        # Tracked files are forced to the new version, as the launcher does.
+        write(os.path.join(self.working, "app.txt"), "edited by the app\n")
+
+        succeeded, pip = self.run_update()
+
+        self.assertTrue(succeeded)
+        pip.assert_not_called()
+        self.assert_updated_with_app_files_kept()
+
+    def test_update_request_uses_a_state_dir_outside_repo(self):
+        self.make_bare_layout()
+        write(os.path.join(self.working, "app.txt"), "edited by the app\n")
+        with mock.patch.object(standalone, "find_repo_path", return_value=self.repo), \
+                mock.patch.object(standalone, "fetch_tags", return_value=([], [])), \
+                mock.patch.object(standalone, "_start_updater") as start:
+            standalone.update_to_version("v1.1.0")
+
+        job_path = start.call_args.args[0]
+        self.assertEqual(os.path.join(self.app, "pyappify-update", "update-job.json"), job_path)
+        self.assertEqual(self.repo, json.loads(read(job_path))["repo_path"])
+
+    def test_first_update_converts_an_old_install(self):
+        self.make_old_layout()
+        self.add_app_files()
+        self.assertEqual(self.repo, standalone.find_repo_path(self.working, environ={}))
+
+        succeeded, _pip = self.run_update()
+
+        self.assertTrue(succeeded)
+        self.assert_updated_with_app_files_kept()
+        self.assertFalse(os.path.exists(os.path.join(self.app, "repo.checkout.old")))
+        self.assertFalse(os.path.exists(os.path.join(self.app, "repo.git.migrating")))
+        self.assertIn("bare = true", read(os.path.join(self.repo, "config")))
+
+    def test_finishes_an_interrupted_conversion(self):
+        self.make_old_layout()
+        # Interrupted after the git data was moved out of repo.
+        os.rename(os.path.join(self.repo, ".git"), os.path.join(self.app, "repo.git.migrating"))
+
+        self.assertEqual(self.repo, standalone.find_repo_path(self.working, environ={}))
+        self.assertFalse(os.path.exists(os.path.join(self.app, "repo.git.migrating")))
+        self.assertEqual("v1.0.0", standalone.detect_app_version(self.working))
+
+    def test_converts_and_updates_an_install_with_a_submodule(self):
+        templates = os.path.join(self.root, "templates")
+        os.makedirs(templates)
+        git(templates, "init", "-q", "-b", "main")
+        write(os.path.join(templates, "template.txt"), "t1\n")
+        git(templates, "add", "-A")
+        git(templates, "commit", "-q", "-m", "templates")
+        git(self.remote, "-c", "protocol.file.allow=always", "submodule", "add", "-q", templates, "ok_templates")
+        self.commit("Add templates")
+        git(self.remote, "tag", "v1.2.0")
+        self.commit_file("app.txt", "1.3.0\n", "Release 1.3.0")
+        git(self.remote, "tag", "v1.3.0")
+
+        git(self.root, "clone", "-q", self.remote, self.repo)
+        git(self.repo, "checkout", "-q", "v1.2.0")
+        git(self.repo, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+        # Dulwich, like git, refuses file:// submodule URLs unless allowed.
+        git(self.repo, "config", "protocol.file.allow", "always")
+        copy_without_git(self.repo, self.working)
+        self.add_app_files()
+
+        succeeded, _pip = self.run_update("v1.3.0")
+
+        self.assertTrue(succeeded)
+        self.assertEqual("1.3.0\n", read(os.path.join(self.working, "app.txt")))
+        self.assertEqual("t1\n", read(os.path.join(self.working, "ok_templates", "template.txt")))
+        self.assertEqual(
+            "gitdir: ../../repo/modules/ok_templates",
+            read(os.path.join(self.working, "ok_templates", ".git")).strip(),
+        )
+        self.assertEqual("{}", read(os.path.join(self.working, "configs", "user.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "ok_templates")))
+
+
 if __name__ == "__main__":
     unittest.main()
