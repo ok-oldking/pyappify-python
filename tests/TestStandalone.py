@@ -10,7 +10,7 @@ from unittest import mock
 
 import pyappify
 from pyappify import standalone, standalone_updater
-from pyappify.versions import is_release_version, sort_version_tags
+from pyappify.versions import is_release_version, select_kept_tags, sort_version_tags
 
 try:
     import dulwich  # noqa: F401
@@ -63,6 +63,12 @@ class TestVersionTags(unittest.TestCase):
             ["v1.1.0", "1.1.0-rc.2", "v1.1.0.rc", "v1.1.0-beta", "v1.1.0-alpha.1", "v1.0.0"],
             sort_version_tags(tags),
         )
+
+    def test_keeps_newest_releases_and_newer_prereleases(self):
+        tags = ["v1.0.0", "v1.1.0-beta.1", "v1.1.0", "v1.2.0", "v1.3.0-beta.2", "latest"]
+        self.assertEqual(["v1.3.0-beta.2", "v1.2.0", "v1.1.0"], select_kept_tags(tags, 2))
+        self.assertEqual(["v1.3.0-beta.2", "v1.2.0"], select_kept_tags(tags, 1))
+        self.assertEqual(5, len(select_kept_tags(tags, 10)))
 
     def test_release_versions(self):
         self.assertTrue(is_release_version("1.5.0"))
@@ -188,6 +194,33 @@ class TestStandaloneVersionList(StandaloneRepoTestCase):
 
         self.assertEqual(["v1.2.0", "v1.1.0"], [v["version"] for v in versions])
         self.assertEqual("v1.0.0", versions[1]["previous_version"])
+
+    def local_tags(self):
+        with standalone.open_repo(self.clone) as repo:
+            return sorted(name.decode() for name in repo.refs.as_dict(standalone.TAG_PREFIX))
+
+    def test_keep_releases_from_repo_config_fetches_only_kept_tags(self):
+        git(self.clone, "config", "pyappify.keepreleases", "1")
+        self.add_remote_release("v1.2.0")
+        self.add_remote_release("v1.3.0-beta")
+
+        standalone.fetch_tags(self.clone)
+
+        # v1.0.0 stays because it is checked out.
+        self.assertEqual(["v1.0.0", "v1.2.0", "v1.3.0-beta"], self.local_tags())
+
+    def test_keep_releases_from_pyappify_yml_at_head(self):
+        write(
+            os.path.join(self.remote, "pyappify.yml"),
+            "keep_releases: 1\n" + PYAPPIFY_YML,
+        )
+        self.add_remote_release("v1.2.0")
+        git(self.clone, "fetch", "-q", "--tags")
+        git(self.clone, "checkout", "-q", "v1.2.0")
+
+        standalone.fetch_tags(self.clone)
+
+        self.assertEqual(["v1.2.0"], self.local_tags())
 
     def test_detects_version_tag_at_head(self):
         self.assertEqual("v1.0.0", standalone.detect_app_version())
