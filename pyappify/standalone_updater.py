@@ -109,6 +109,8 @@ def refresh_shortcuts(job, log):
         return []
     for path in paths:
         log.info("Refreshed shortcut %s", path)
+    if not paths:
+        log.info("Shortcuts are up to date.")
     return paths
 
 

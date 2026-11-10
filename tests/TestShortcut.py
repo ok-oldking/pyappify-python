@@ -104,6 +104,41 @@ class TestCreateShortcut(unittest.TestCase):
         self.assertFalse(details["run_as_admin"])
         self.assertNotIn("outside", details["icon"])
 
+    def test_returns_only_shortcuts_created_or_changed(self):
+        icon = os.path.join(self.working, "icons", "app.ico")
+        open(icon, "wb").close()
+        kwargs = dict(name="Demo", target=sys.executable, arguments=["main.py"],
+                      working_dir=self.working, icon=icon, run_as_admin=False)
+        other = os.path.join(self.root, "Desktop")
+        path = os.path.join(self.out, "Demo.lnk")
+
+        self.assertEqual([path], pyappify.create_shortcut(directories=[self.out], **kwargs))
+        before = os.stat(path).st_mtime_ns
+        self.assertEqual([], pyappify.create_shortcut(directories=[self.out], **kwargs))
+        self.assertEqual(before, os.stat(path).st_mtime_ns, "an up-to-date shortcut is not rewritten")
+
+        # A new location is created while the up-to-date one is skipped.
+        self.assertEqual(
+            [os.path.join(other, "Demo.lnk")],
+            pyappify.create_shortcut(directories=[self.out, other], **kwargs),
+        )
+        for change in (dict(arguments=["main.py", "--x"]), dict(icon=""), dict(run_as_admin=True),
+                       dict(working_dir=self.root), dict(target=os.path.join(self.root, "x.exe"))):
+            with self.subTest(change=change):
+                self.assertEqual(
+                    [path], pyappify.create_shortcut(directories=[self.out], **dict(kwargs, **change))
+                )
+                pyappify.create_shortcut(directories=[self.out], **kwargs)
+        self.assertEqual("", read_shortcut(path)["arguments"].replace("main.py", ""))
+
+    def test_disabled_locations_are_not_created_or_updated(self):
+        kwargs = dict(name="Demo", target=sys.executable, arguments="", working_dir=self.working)
+        with self.fake_known_folders():
+            self.assertEqual([], pyappify.create_shortcut(start_menu=False, desktop=False, **kwargs))
+            only_desktop = pyappify.create_shortcut(start_menu=False, **kwargs)
+        self.assertEqual([os.path.join(self.root, "Desktop", "Demo.lnk")], only_desktop)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "Programs")))
+
     def fake_known_folders(self):
         folders = {
             shortcut._CSIDL_PROGRAMS: os.path.join(self.root, "Programs"),
@@ -128,6 +163,10 @@ class TestCreateShortcut(unittest.TestCase):
 
         self.assertEqual(first + [desktop_link], second)
         self.assertEqual("main.py --v2", read_shortcut(desktop_link)["arguments"])
+        with self.fake_known_folders():
+            self.assertEqual([], pyappify.refresh_shortcuts(
+                target=sys.executable, arguments=["main.py", "--v2"], working_dir=self.working
+            ))
 
     def test_updater_refreshes_shortcuts_with_the_job_command_and_profile(self):
         self.write_yml(
