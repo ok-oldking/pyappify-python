@@ -109,8 +109,7 @@ def refresh_shortcuts(job, log):
         return []
     try:
         paths = shortcut.refresh_shortcuts(
-            target=argv[0],
-            arguments=argv[1:],
+            command=argv,
             working_dir=relaunch_info.get("cwd") or standalone.app_files_dir(job["repo_path"]),
             profile=job.get("profile") or "",
         )

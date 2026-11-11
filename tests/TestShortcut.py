@@ -86,7 +86,11 @@ class TestCreateShortcut(unittest.TestCase):
 
         details = read_shortcut(paths[0])
         self.assertEqual(os.path.join(self.out, "ok-demo.lnk"), paths[0])
-        self.assertEqual("main.py --start", details["arguments"])
+        # The profile's main_script, not the running command line (main.py --start).
+        self.assertEqual(os.path.normcase(sys.executable), os.path.normcase(details["target"]))
+        self.assertEqual(
+            subprocess.list2cmdline([os.path.join(self.working, "main.py")]), details["arguments"]
+        )
         self.assertEqual(os.path.join(self.working, "icons", "icon.ico") + ",0", details["icon"])
         self.assertTrue(details["run_as_admin"], "Global inherits admin from the first profile")
 
@@ -200,6 +204,99 @@ class TestCreateShortcut(unittest.TestCase):
         with mock.patch.object(shortcut, "refresh_shortcuts", side_effect=OSError("boom")):
             self.assertEqual([], standalone_updater.refresh_shortcuts(job, log))
         log.warning.assert_called_once()
+
+    def test_shortcuts_use_pythonw_so_no_console_window_opens(self):
+        scripts = os.path.join(self.root, "venv", "Scripts")
+        os.makedirs(scripts)
+        python = os.path.join(scripts, "python.exe")
+        pythonw = os.path.join(scripts, "pythonw.exe")
+        for path in (python, pythonw):
+            open(path, "wb").close()
+
+        self.assertEqual(pythonw, shortcut.windowless_python(python))
+        self.assertEqual(pythonw, shortcut.windowless_python(os.path.join(scripts, "Python.EXE")))
+        self.assertEqual(pythonw, shortcut.windowless_python(pythonw))
+        other = os.path.join(self.root, "app.exe")
+        self.assertEqual(other, shortcut.windowless_python(other))
+        os.remove(pythonw)
+        self.assertEqual(python, shortcut.windowless_python(python), "kept without a pythonw.exe")
+        open(pythonw, "wb").close()
+
+        # The default target (the running interpreter) and the updater's refresh.
+        with mock.patch.object(shortcut.standalone, "_relaunch_argv",
+                               return_value=[python, "-X", "utf8", "main.py"]):
+            path = pyappify.create_shortcut(name="Demo", working_dir=self.working,
+                                            directories=[self.out])[0]
+        self.assertEqual(os.path.normcase(pythonw), os.path.normcase(read_shortcut(path)["target"]))
+        self.assertEqual("-X utf8 main.py", read_shortcut(path)["arguments"])
+
+        job = {"repo_path": self.working, "refresh_shortcuts": True,
+               "relaunch": {"argv": [python, "main.py"], "cwd": self.working}}
+        with self.fake_known_folders():
+            refreshed = standalone_updater.refresh_shortcuts(job, mock.Mock())
+        self.assertEqual(os.path.normcase(pythonw), os.path.normcase(read_shortcut(refreshed[0])["target"]))
+
+    def make_python(self):
+        scripts = os.path.join(self.root, "venv", "Scripts")
+        os.makedirs(scripts, exist_ok=True)
+        for name in ("python.exe", "pythonw.exe"):
+            open(os.path.join(scripts, name), "wb").close()
+        return os.path.join(scripts, "python.exe"), os.path.join(scripts, "pythonw.exe")
+
+    def test_dev_checkout_shortcut_follows_main_script_and_use_pythonw(self):
+        python, pythonw = self.make_python()
+        self.write_yml(
+            "profiles:\n"
+            '  - name: "China"\n'
+            '    main_script: "main.py"\n'
+            "    use_pythonw: true\n"
+            '  - name: "Global"\n'
+        )
+        main = os.path.join(self.working, "main.py")
+        open(main, "w").close()
+        # Started for debugging with a console Python and another script.
+        debug_command = [python, "-X", "utf8", "-u", "main_debug.py"]
+
+        with mock.patch.object(pyappify, "app_profile", "Global"):
+            path = pyappify.create_shortcut(working_dir=self.working, directories=[self.out],
+                                            command=debug_command)[0]
+            details = read_shortcut(path)
+            self.assertEqual(os.path.normcase(pythonw), os.path.normcase(details["target"]))
+            self.assertEqual(subprocess.list2cmdline([main]), details["arguments"])
+
+            self.write_yml(
+                "profiles:\n"
+                '  - name: "Global"\n'
+                '    main_script: "main.py"\n'
+            )
+            path = pyappify.create_shortcut(working_dir=self.working, directories=[self.out],
+                                            command=debug_command)[0]
+            self.assertEqual(
+                os.path.normcase(python), os.path.normcase(read_shortcut(path)["target"]),
+                "use_pythonw defaults to false, as in the launcher",
+            )
+
+            exe = os.path.join(self.working, "app.exe")
+            open(exe, "wb").close()
+            self.write_yml('profiles:\n  - name: "Global"\n    main_script: "app.exe"\n')
+            path = pyappify.create_shortcut(working_dir=self.working, directories=[self.out],
+                                            command=debug_command)[0]
+            details = read_shortcut(path)
+            self.assertEqual(os.path.normcase(exe), os.path.normcase(details["target"]))
+            self.assertEqual("", details["arguments"])
+
+    def test_updater_refresh_runs_main_script_with_the_apps_python(self):
+        python, pythonw = self.make_python()
+        self.write_yml('profiles:\n  - name: "Global"\n    main_script: "main.py"\n    use_pythonw: true\n')
+        job = {"repo_path": self.working, "refresh_shortcuts": True, "profile": "Global",
+               "relaunch": {"argv": [python, "main_debug.py"], "cwd": self.working}}
+        with self.fake_known_folders():
+            path = standalone_updater.refresh_shortcuts(job, mock.Mock())[0]
+        details = read_shortcut(path)
+        self.assertEqual(os.path.normcase(pythonw), os.path.normcase(details["target"]))
+        self.assertEqual(
+            subprocess.list2cmdline([os.path.join(self.working, "main.py")]), details["arguments"]
+        )
 
     def test_default_locations_are_start_menu_and_desktop(self):
         with mock.patch.object(shortcut, "_known_folder", side_effect=lambda csidl: str(csidl)):
