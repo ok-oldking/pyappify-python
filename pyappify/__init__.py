@@ -35,6 +35,7 @@ from .launcher import (
 )
 from .self_upgrade import upgrade
 from .shortcut import create_shortcut, refresh_shortcuts
+from .updates import PIP_INDEX_URLS, get_pip_index_config, set_pip_index_url
 from .updates import get_version_list, get_versions, is_local_checkout, update_to_version
 from .versions import calculate_update_notes, is_greater_version
 

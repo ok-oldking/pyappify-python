@@ -917,5 +917,59 @@ class TestLauncherLayout(StandaloneRepoTestCase):
         self.assertFalse(os.path.exists(os.path.join(self.repo, "ok_templates")))
 
 
+class TestStandalonePipIndex(unittest.TestCase):
+    def test_invalid_file_uses_defaults_and_warns_during_install(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            standalone, "find_repo_path", return_value=directory
+        ), mock.patch.object(standalone, "state_dir", return_value=directory), mock.patch.object(
+            pyappify.updates, "_is_python_test", return_value=False
+        ), mock.patch.object(pyappify.updates, "uses_launcher", return_value=False):
+            process = mock.Mock(stdout=[])
+            process.wait.return_value = 0
+            for content in ('{bad json', '[]', '{}', '{"pip_index_url": 42}',
+                            '{"pip_index_url": "https://unknown.invalid/"}'):
+                with self.subTest(content=content):
+                    write(os.path.join(directory, "pip-index.json"), content)
+                    self.assertEqual("", pyappify.get_pip_index_config()["pip_index_url"])
+                    log = mock.Mock()
+                    with mock.patch.object(standalone_updater.subprocess, "Popen", return_value=process) as popen:
+                        standalone_updater.pip_install(directory, "demo", "--no-deps", log)
+                    self.assertNotIn("--index-url", popen.call_args.args[0])
+                    process.wait.assert_called()
+                    log.warning.assert_called_once()
+                    pyappify.set_pip_index_url(pyappify.PIP_INDEX_URLS[1])
+                    self.assertEqual(pyappify.PIP_INDEX_URLS[1], pyappify.get_pip_index_config()["pip_index_url"])
+
+    def test_persistence_and_pip_arguments(self):
+        from pyappify import pip_index
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            standalone, "find_repo_path", return_value=directory
+        ), mock.patch.object(standalone, "state_dir", return_value=directory), mock.patch.object(
+            pyappify.updates, "_is_python_test", return_value=False
+        ), mock.patch.object(pyappify.updates, "uses_launcher", return_value=False):
+            self.assertEqual("", pyappify.get_pip_index_config()["pip_index_url"])
+            with self.assertRaises(ValueError):
+                pyappify.set_pip_index_url("https://unknown.invalid/")
+            with self.assertRaises(TypeError):
+                pyappify.set_pip_index_url(None)
+            selected = pyappify.PIP_INDEX_URLS[2]
+            pyappify.set_pip_index_url(selected)
+            self.assertEqual(selected, json.loads(read(os.path.join(directory, "pip-index.json")))["pip_index_url"])
+            self.assertEqual(selected, pyappify.get_pip_index_config()["pip_index_url"])
+            process = mock.Mock(stdout=[])
+            process.wait.return_value = 0
+            for url in (selected, ""):
+                pyappify.set_pip_index_url(url)
+                for args in ("--no-deps", "--index-url https://profile/", "-i https://profile/",
+                             "--index-url=https://profile/", "-ihttps://profile/"):
+                    with mock.patch.object(standalone_updater.subprocess, "Popen", return_value=process) as popen:
+                        standalone_updater.pip_install(directory, "demo", args, mock.Mock())
+                    command = popen.call_args.args[0]
+                    self.assertEqual(bool(url) and args == "--no-deps", selected in command)
+                    self.assertEqual(args == "--no-deps" and bool(url), "--index-url" in command and selected in command)
+                    self.assertIn("demo", command)
+            self.assertEqual("", pip_index.read_url(directory))
+
+
 if __name__ == "__main__":
     unittest.main()

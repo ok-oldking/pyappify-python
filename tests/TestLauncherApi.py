@@ -287,5 +287,62 @@ class TestLauncherApi(unittest.TestCase):
         sleep.assert_called_once_with(5)
 
 
+class TestPipIndexLauncher(unittest.TestCase):
+    def test_missing_capability_does_not_call_launcher(self):
+        with mock.patch.dict(os.environ), mock.patch.object(
+            pyappify.updates, "_is_python_test", return_value=False
+        ), mock.patch.object(pyappify.updates, "uses_launcher", return_value=True), mock.patch.object(
+            pyappify.launcher, "_run_launcher_api"
+        ) as run:
+            for capability in (None, "0", "true"):
+                if capability is None:
+                    os.environ.pop("PYAPPIFY_PIP_INDEX_API", None)
+                else:
+                    os.environ["PYAPPIFY_PIP_INDEX_API"] = capability
+                for call in (pyappify.get_pip_index_config, lambda: pyappify.set_pip_index_url("")):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "^This PyAppify launcher does not support choosing the pip index$"
+                    ):
+                        call()
+            run.assert_not_called()
+
+    def test_arguments_and_response(self):
+        expected = {"pip_index_url": "", "default": "", "options": [""]}
+        event = threading.Event()
+        with mock.patch.dict(os.environ, {"PYAPPIFY_PIP_INDEX_API": "1"}), mock.patch.object(
+            pyappify.updates, "_is_python_test", return_value=False
+        ), mock.patch.object(
+            pyappify.updates, "uses_launcher", return_value=True
+        ), mock.patch.object(pyappify.launcher, "_run_launcher_api", return_value=expected) as run:
+            self.assertEqual(expected, pyappify.get_pip_index_config())
+            run.assert_called_with(["--get-pip-index-url"], timeout=10, exit_event=None)
+            self.assertEqual(expected, pyappify.set_pip_index_url("", timeout=2, exit_event=event))
+            run.assert_called_with(["--set-pip-index-url", "default"], timeout=2, exit_event=event)
+            pyappify.set_pip_index_url("https://launcher-only.invalid/")
+            run.assert_called_with(["--set-pip-index-url", "https://launcher-only.invalid/"], timeout=10, exit_event=None)
+
+    def test_invalid_responses_and_timeout(self):
+        with mock.patch.dict(os.environ, {"PYAPPIFY_PIP_INDEX_API": "1"}), mock.patch.object(
+            pyappify.updates, "_is_python_test", return_value=False
+        ), mock.patch.object(
+            pyappify.updates, "uses_launcher", return_value=True
+        ), mock.patch.object(pyappify.launcher, "_run_launcher_api") as run:
+            for response in (None, [], {}, {"pip_index_url": 1, "default": "", "options": []},
+                             {"pip_index_url": "", "default": None, "options": []},
+                             {"pip_index_url": "", "default": "", "options": ""},
+                             {"pip_index_url": "", "default": "", "options": [1]}):
+                run.return_value = response
+                with self.assertRaises(RuntimeError):
+                    pyappify.get_pip_index_config()
+                with self.assertRaises(RuntimeError):
+                    pyappify.set_pip_index_url("")
+            for error in (TimeoutError, InterruptedError, RuntimeError):
+                run.side_effect = error("unsupported")
+                with self.assertRaises(error):
+                    pyappify.get_pip_index_config()
+                with self.assertRaises(error):
+                    pyappify.set_pip_index_url("")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -118,5 +118,29 @@ class TestUpdateEnv(unittest.TestCase):
         self.assertEqual("en", self._reload_with_env().get_locale())
 
 
+class TestPipIndexTestMode(unittest.TestCase):
+    def test_round_trip_and_validation(self):
+        with mock.patch.dict(os.environ, {"PYAPPIFY_PYTHON_TEST": "1"}), mock.patch.object(
+            pyappify.updates, "_test_pip_index_url", ""
+        ), mock.patch.object(pyappify.launcher, "_run_launcher_api") as run:
+            self.assertEqual("", pyappify.get_pip_index_config()["pip_index_url"])
+            for url in pyappify.PIP_INDEX_URLS:
+                result = pyappify.set_pip_index_url(url)
+                self.assertEqual(result, pyappify.get_pip_index_config())
+                self.assertEqual(url, result["pip_index_url"])
+                self.assertEqual("", result["default"])
+                self.assertEqual(list(pyappify.PIP_INDEX_URLS), result["options"])
+            with self.assertRaises(ValueError):
+                pyappify.set_pip_index_url("default")
+            for value in (None, 1, False):
+                with self.assertRaises(TypeError):
+                    pyappify.set_pip_index_url(value)
+            event = __import__("threading").Event()
+            event.set()
+            with self.assertRaises(InterruptedError):
+                pyappify.get_pip_index_config(exit_event=event)
+            run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

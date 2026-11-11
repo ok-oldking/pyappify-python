@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-from . import _process, shortcut, standalone
+from . import _process, shortcut, standalone, pip_index
 
 SUCCESS_CLOSE_DELAY_SECONDS = 3
 APP_STOP_TIMEOUT_SECONDS = 15
@@ -225,7 +225,16 @@ def _checkout(repo, commit_id, log, force=False):
 
 def pip_install(repo_path, spec, pip_args, log):
     command = [sys.executable, "-m", "pip", "install", "--no-warn-script-location"]
-    command.extend(pip_args.split())
+    args = pip_args.split()
+    command.extend(args)
+    explicit_index = any(
+        arg in ("--index-url", "-i") or arg.startswith("--index-url=")
+        or (arg.startswith("-i") and len(arg) > 2) for arg in args
+    )
+    if not explicit_index:
+        url = pip_index.read_url(repo_path, log=log)
+        if url:
+            command.extend(["--index-url", url])
     if spec.endswith(".txt"):
         requirements_path = os.path.join(repo_path, spec)
         if not os.path.isfile(requirements_path):
