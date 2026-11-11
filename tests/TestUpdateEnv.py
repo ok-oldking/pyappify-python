@@ -19,7 +19,9 @@ class TestUpdateEnv(unittest.TestCase):
     def setUp(self):
         self._saved_env = {key: os.environ.get(key) for key in ENV_KEYS}
         # This checkout's HEAD may carry a version tag; keep these tests about the env.
-        detect = mock.patch.object(pyappify.standalone, "detect_app_version", return_value=None)
+        detect = mock.patch.object(
+            pyappify.standalone, "detect_app_checkout", return_value=(None, None)
+        )
         detect.start()
         self.addCleanup(detect.stop)
 
@@ -97,7 +99,7 @@ class TestUpdateEnv(unittest.TestCase):
         )
 
     def test_without_launcher_uses_version_tag_of_the_checkout(self):
-        pyappify.standalone.detect_app_version.return_value = "v1.4.0"
+        pyappify.standalone.detect_app_checkout.return_value = ("v1.4.0", "main")
         old_executable = os.environ.pop("PYAPPIFY_EXECUTABLE", None)
         self.addCleanup(
             lambda: old_executable is not None
@@ -107,6 +109,7 @@ class TestUpdateEnv(unittest.TestCase):
         module = self._reload_with_env()
 
         self.assertEqual("v1.4.0", module.app_version)
+        self.assertEqual("main", module.app_ref)
         self.assertEqual("v1.4.0", module.app_starting_version)
         self.assertFalse(module.is_app_updated())
 

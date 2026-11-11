@@ -21,6 +21,17 @@ def uses_launcher():
     return bool(state.pyappify_version or state.pyappify_executable)
 
 
+def is_local_checkout():
+    """Return whether the app runs from a plain git clone, without the launcher.
+
+    Such a checkout also lists its default branch, local branches and pull
+    requests as versions when ``release_only`` is false.
+    """
+    if uses_launcher() or _is_python_test():
+        return False
+    return standalone.is_plain_checkout()
+
+
 def get_version_list(
     number_versions=10, release_only=True, timeout=120, exit_event=None
 ):

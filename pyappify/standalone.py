@@ -8,7 +8,10 @@ installed (``pip install "pyappify[standalone]"``).
 Two layouts are supported:
 
 - a plain git clone the app runs from (updates refuse to overwrite local
-  changes to tracked files);
+  changes to tracked files). When test versions are listed, it also offers,
+  before the version tags: the remote's default branch, its local branches
+  (``local/<branch>``) and the open pull requests of a GitHub remote
+  (``pr/<number>``);
 - the launcher's layout, where the app runs from ``<app>/working`` and
   ``<app>/repo`` is a bare repository whose work tree is ``working``. Files the
   app creates in ``working`` are kept; tracked files are forced to the new
@@ -24,21 +27,48 @@ which opens its own console window for the log, waits for the app to exit
 import functools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
 import types
+import urllib.request
 from contextlib import contextmanager
 
 from . import _process
 from ._state import get_logger
-from .versions import is_release_version, select_kept_tags, sort_version_tags
+from .versions import is_release_version, is_version_tag, select_kept_tags, sort_version_tags
 
 REMOTE_NAME = b"origin"
 TAG_PREFIX = b"refs/tags/"
 PEELED_SUFFIX = b"^{}"
+HEAD_REF = b"HEAD"
+BRANCH_PREFIX = b"refs/heads/"
+REMOTE_BRANCH_PREFIX = b"refs/remotes/origin/"
+REMOTE_HEAD_REF = REMOTE_BRANCH_PREFIX + HEAD_REF
+# Pull request heads: refs/pull/<n>/head on the remote, kept locally under
+# refs/pyappify/pull/<n> so they never mix with the user's own refs.
+REMOTE_PULL_REF = b"refs/pull/%d/head"
+LOCAL_PULL_PREFIX = b"refs/pyappify/pull/"
+
+# What a version of a plain git clone can be, besides a version tag.
+KIND_BRANCH = "branch"  # the remote's default branch; the version is its name
+KIND_LOCAL = "local"    # a local branch; the version is "local/<branch>"
+KIND_PULL = "pr"        # an open pull request; the version is "pr/<number>"
+KIND_TAG = "tag"
+LOCAL_VERSION_PREFIX = "local/"
+PULL_VERSION_PREFIX = "pr/"
+MAX_LOCAL_BRANCHES = 10
+MAX_PULL_REQUESTS = 10
+PULL_REQUEST_TIMEOUT_SECONDS = 15
+
+# How a listed version relates to the checked-out commit.
+RELATION_CURRENT = "current"
+RELATION_NEWER = "newer"
+RELATION_OLDER = "older"
+RELATION_OTHER = "other"
 MAX_UPDATE_NOTE_LINES = 10
 PYAPPIFY_YML = "pyappify.yml"
 DEFAULT_REQUIREMENTS = "requirements.txt"
@@ -65,6 +95,7 @@ def _dulwich():
         from dulwich import porcelain
         from dulwich.client import get_transport_and_path
         from dulwich.errors import NotGitRepository
+        from dulwich.graph import can_fast_forward
         from dulwich.object_store import tree_lookup_path
         from dulwich.repo import Repo
         from dulwich.walk import ORDER_DATE
@@ -78,6 +109,7 @@ def _dulwich():
         porcelain=porcelain,
         get_transport_and_path=get_transport_and_path,
         NotGitRepository=NotGitRepository,
+        can_fast_forward=can_fast_forward,
         tree_lookup_path=tree_lookup_path,
         Repo=Repo,
         ORDER_DATE=ORDER_DATE,
@@ -396,6 +428,163 @@ def read_file_at(repo, commit_id, path):
         return None
 
 
+# --- branches and pull requests -----------------------------------------------
+
+
+def _ref(repo, name):
+    try:
+        return repo.refs[name]
+    except KeyError:
+        return None
+
+
+def _pull_ref(number):
+    return LOCAL_PULL_PREFIX + b"%d" % int(number)
+
+
+def _followed_ref(repo, name):
+    """The ref a symbolic ref points at, or None."""
+    try:
+        names, _sha = repo.refs.follow(name)
+    except KeyError:
+        return None
+    return names[-1] if len(names) > 1 else None
+
+
+def head_ref(repo):
+    """Return the checked-out branch or stored pull request label, or None."""
+    head = repo.refs.read_loose_ref(HEAD_REF)
+    if not head:
+        return None
+    if head.startswith(b"ref: "):
+        target = head[5:].strip()
+        if target.startswith(BRANCH_PREFIX):
+            return target[len(BRANCH_PREFIX):].decode("utf-8", "replace")
+        return None
+    targets = dict(repo.refs.get_packed_refs())
+    for ref in repo.refs.allkeys():
+        if ref.startswith(LOCAL_PULL_PREFIX):
+            loose = repo.refs.read_loose_ref(ref)
+            if loose is not None:
+                targets[ref] = loose
+    numbers = [
+        int(ref[len(LOCAL_PULL_PREFIX):])
+        for ref, sha in targets.items()
+        if ref.startswith(LOCAL_PULL_PREFIX)
+        and ref[len(LOCAL_PULL_PREFIX):].isdigit() and sha == head
+    ]
+    return "pr#{}".format(min(numbers)) if numbers else None
+
+
+def head_branch(repo):
+    """Name of the checked-out branch, or None when HEAD is detached."""
+    target = _followed_ref(repo, HEAD_REF)
+    if target and target.startswith(BRANCH_PREFIX):
+        return target[len(BRANCH_PREFIX):].decode("utf-8", "replace")
+    return None
+
+
+def default_branch(repo):
+    """Name of the remote's default branch as last fetched, or None."""
+    target = _followed_ref(repo, REMOTE_HEAD_REF)
+    if target and target.startswith(REMOTE_BRANCH_PREFIX) and _ref(repo, target):
+        return target[len(REMOTE_BRANCH_PREFIX):].decode("utf-8", "replace")
+    for name in ("main", "master"):
+        if _ref(repo, REMOTE_BRANCH_PREFIX + name.encode("ascii")):
+            return name
+    return None
+
+
+def is_ancestor(repo, ancestor, commit):
+    """Return whether ``commit`` is ``ancestor`` or descends from it."""
+    try:
+        return _dulwich().can_fast_forward(repo, ancestor, commit)
+    except Exception:
+        return False
+
+
+def commit_relation(repo, head, commit):
+    """How ``commit`` relates to the checked-out ``head`` commit."""
+    if head is None:
+        return RELATION_OTHER
+    if commit == head:
+        return RELATION_CURRENT
+    if is_ancestor(repo, head, commit):
+        return RELATION_NEWER
+    if is_ancestor(repo, commit, head):
+        return RELATION_OLDER
+    return RELATION_OTHER
+
+
+def branch_target(repo, name):
+    """Commit an update to the remote branch ``name`` checks out.
+
+    That is the fetched remote tip, which a local branch of that name is
+    fast-forwarded to. Local commits the remote does not have are kept: they
+    are the target when the remote has nothing new, and an error when both
+    sides have new commits.
+    """
+    remote = _ref(repo, REMOTE_BRANCH_PREFIX + name.encode("utf-8"))
+    if remote is None:
+        raise StandaloneUpdateError("Branch '{}' does not exist on the remote.".format(name))
+    local = _ref(repo, BRANCH_PREFIX + name.encode("utf-8"))
+    if local is None or local == remote or is_ancestor(repo, local, remote):
+        return remote
+    if is_ancestor(repo, remote, local):
+        return local
+    raise StandaloneUpdateError(
+        "Cannot update to '{0}': the local branch '{0}' and origin/{0} have "
+        "diverged. Merge or rebase it first.".format(name)
+    )
+
+
+def version_kind(version):
+    """Classify a version string; anything unprefixed that is no tag is a branch."""
+    if is_version_tag(version):
+        return KIND_TAG
+    if version.startswith(PULL_VERSION_PREFIX) and version[len(PULL_VERSION_PREFIX):].isdigit():
+        return KIND_PULL
+    if version.startswith(LOCAL_VERSION_PREFIX) and len(version) > len(LOCAL_VERSION_PREFIX):
+        return KIND_LOCAL
+    return KIND_BRANCH
+
+
+def resolve_version(repo, version, tags_only=False):
+    """Return ``(kind, commit, branch)`` for a version of the checkout.
+
+    ``branch`` is the local branch to check out; None leaves HEAD detached at
+    ``commit``, as for version tags and pull requests. ``tags_only`` is for the
+    launcher's layout, whose versions are always tags.
+    """
+    kind = KIND_TAG if tags_only else version_kind(version)
+    if kind == KIND_PULL:
+        number = version[len(PULL_VERSION_PREFIX):]
+        commit = _ref(repo, _pull_ref(number))
+        if commit is None:
+            raise StandaloneUpdateError("Pull request #{} was not fetched.".format(number))
+        return kind, commit, None
+    if kind == KIND_LOCAL:
+        branch = version[len(LOCAL_VERSION_PREFIX):]
+        commit = _ref(repo, BRANCH_PREFIX + branch.encode("utf-8"))
+        if commit is None:
+            raise StandaloneUpdateError("Local branch '{}' does not exist.".format(branch))
+        return kind, commit, branch
+    if kind == KIND_BRANCH and _ref(repo, REMOTE_BRANCH_PREFIX + version.encode("utf-8")):
+        return kind, branch_target(repo, version), version
+    # A version tag, or a tag whose name is not in the version format.
+    return KIND_TAG, tag_commit(repo, version), None
+
+
+def attach_branch(repo, branch, commit):
+    """Point the local ``branch`` at ``commit`` and make it the checked-out branch.
+
+    The work tree must already be at ``commit``.
+    """
+    ref = BRANCH_PREFIX + branch.encode("utf-8")
+    repo.refs[ref] = commit
+    repo.refs.set_symbolic_ref(HEAD_REF, ref)
+
+
 # --- fetching ---------------------------------------------------------------
 
 # Written by the launcher from pyappify.yml's ``keep_releases``.
@@ -445,6 +634,22 @@ def head_tags(repo):
     return tags
 
 
+def remote_url(repo):
+    """URL of the checkout's ``origin`` remote."""
+    try:
+        return repo.get_config().get((b"remote", REMOTE_NAME), b"url").decode("utf-8")
+    except KeyError:
+        raise StandaloneUpdateError(
+            "The git checkout at {} has no 'origin' remote.".format(repo.path)
+        )
+
+
+def _remote_client(repo):
+    return _dulwich().get_transport_and_path(
+        remote_url(repo), config=repo.get_config_stack()
+    )
+
+
 def fetch_tags(repo_path, progress=None):
     """Mirror the remote's tags, like ``git fetch origin +refs/tags/*:refs/tags/* --prune``.
 
@@ -452,17 +657,8 @@ def fetch_tags(repo_path, progress=None):
     tags are fetched and kept locally, plus the tags of the checked-out commit.
     Returns ``(updated, pruned)`` tag names.
     """
-    dulwich = _dulwich()
     with open_repo(repo_path) as repo:
-        try:
-            url = repo.get_config().get((b"remote", REMOTE_NAME), b"url")
-        except KeyError:
-            raise StandaloneUpdateError(
-                "The git checkout at {} has no 'origin' remote.".format(repo_path)
-            )
-        client, remote_path = dulwich.get_transport_and_path(
-            url.decode("utf-8"), config=repo.get_config_stack()
-        )
+        client, remote_path = _remote_client(repo)
 
         def is_tag(ref, sha):
             return ref.startswith(TAG_PREFIX) and not ref.endswith(PEELED_SUFFIX) and sha
@@ -516,6 +712,107 @@ def fetch_tags(repo_path, progress=None):
         return updated, pruned
 
 
+def fetch_branches(repo_path, pull_numbers=(), prune_pulls=False, progress=None):
+    """Fetch the remote's default branch and the heads of ``pull_numbers``.
+
+    The default branch goes to ``refs/remotes/origin/<branch>``, with
+    ``refs/remotes/origin/HEAD`` pointing at it; pull request heads go to
+    ``refs/pyappify/pull/<number>``. ``prune_pulls`` drops the stored heads of
+    every other pull request. Local branches are never touched. Returns the
+    default branch's name, or None if the remote does not tell.
+    """
+    with open_repo(repo_path) as repo:
+        client, remote_path = _remote_client(repo)
+        pull_refs = {REMOTE_PULL_REF % number: number for number in pull_numbers}
+        fallback_refs = [
+            BRANCH_PREFIX + name.encode("utf-8")
+            for name in (default_branch(repo), "main", "master") if name
+        ]
+
+        def determine_wants(refs, *_args, **_kwargs):
+            wanted = [refs.get(HEAD_REF)] if refs.get(HEAD_REF) else [
+                refs.get(ref) for ref in fallback_refs
+            ]
+            wanted.extend(refs.get(ref) for ref in pull_refs)
+            wants = []
+            for sha in wanted:
+                if sha and sha not in repo.object_store and sha not in wants:
+                    wants.append(sha)
+            return wants
+
+        result = client.fetch(
+            remote_path,
+            repo,
+            determine_wants=determine_wants,
+            progress=progress,
+            ref_prefix=[HEAD_REF, BRANCH_PREFIX] + list(pull_refs),
+        )
+        refs = result.refs
+
+        branch_ref = (getattr(result, "symrefs", None) or {}).get(HEAD_REF)
+        if not (branch_ref and branch_ref.startswith(BRANCH_PREFIX) and refs.get(branch_ref)):
+            # No symref from the remote: a branch at the remote HEAD's commit.
+            head_sha = refs.get(HEAD_REF)
+            candidates = fallback_refs + sorted(ref for ref in refs if ref.startswith(BRANCH_PREFIX))
+            branch_ref = next(
+                (ref for ref in candidates if refs.get(ref) and refs[ref] == (head_sha or refs[ref])),
+                None,
+            )
+
+        branch = None
+        if branch_ref and refs[branch_ref] in repo.object_store:
+            name = branch_ref[len(BRANCH_PREFIX):]
+            repo.refs[REMOTE_BRANCH_PREFIX + name] = refs[branch_ref]
+            repo.refs.set_symbolic_ref(REMOTE_HEAD_REF, REMOTE_BRANCH_PREFIX + name)
+            branch = name.decode("utf-8", "replace")
+
+        kept = set()
+        for ref, number in pull_refs.items():
+            sha = refs.get(ref)
+            if sha and sha in repo.object_store:
+                repo.refs[_pull_ref(number)] = sha
+                kept.add(b"%d" % number)
+        if prune_pulls:
+            for name in repo.refs.as_dict(LOCAL_PULL_PREFIX):
+                if name not in kept:
+                    del repo.refs[LOCAL_PULL_PREFIX + name]
+        return branch
+
+
+_GITHUB_URL_RE = re.compile(
+    r"^(?:https?://(?:[^@/]+@)?github\.com/|(?:ssh://)?git@github\.com[:/])"
+    r"([^/]+)/([^/]+?)(?:\.git)?/?$"
+)
+
+
+def github_repository(url):
+    """Return ``(owner, name)`` of a github.com remote URL, or None."""
+    match = _GITHUB_URL_RE.match(url or "")
+    return match.groups() if match else None
+
+
+def list_pull_requests(url, limit=MAX_PULL_REQUESTS, timeout=PULL_REQUEST_TIMEOUT_SECONDS):
+    """Open pull requests of a GitHub remote as ``[(number, title)]``, newest first.
+
+    Asks the public GitHub API; remotes on other hosts have none.
+    """
+    repository = github_repository(url)
+    if not repository:
+        return []
+    request = urllib.request.Request(
+        "https://api.github.com/repos/{}/{}/pulls?state=open&per_page={}".format(
+            repository[0], repository[1], limit
+        ),
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "pyappify"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        pulls = json.loads(response.read().decode("utf-8"))
+    return [
+        (int(pull["number"]), str(pull.get("title") or "").strip())
+        for pull in pulls if isinstance(pull, dict) and "number" in pull
+    ][:limit]
+
+
 def _run_cancellable(operation, timeout, exit_event, description):
     """Run ``operation`` in a worker thread so exit_event and timeout stay responsive.
 
@@ -551,6 +848,35 @@ def _fetch_tags_logged(repo_path, timeout, exit_event):
     )
     if updated or pruned:
         log.info("pyappify fetched tags %s, pruned %s", updated, pruned)
+
+
+def _fetch_branches_logged(repo_path, timeout, exit_event, pull_numbers=None):
+    """Fetch the default branch and pull requests; return ``[(number, title)]``.
+
+    ``pull_numbers`` fetches just those; None looks up the open pull requests,
+    which is best effort: without them the default branch is still fetched.
+    """
+    log = get_logger()
+
+    def fetch():
+        if pull_numbers is None:
+            try:
+                with open_repo(repo_path) as repo:
+                    url = remote_url(repo)
+                pulls = list_pull_requests(url)
+            except Exception as error:
+                log.warning("pyappify could not list pull requests: %s", error)
+                pulls = []
+        else:
+            pulls = [(number, "") for number in pull_numbers]
+        branch = fetch_branches(
+            repo_path, [number for number, _title in pulls], prune_pulls=pull_numbers is None
+        )
+        log.info("pyappify fetched default branch %s and %s pull requests", branch, len(pulls))
+        return pulls
+
+    log.info("pyappify fetching branches for %s", repo_path)
+    return _run_cancellable(fetch, timeout, exit_event, "fetching branches")
 
 
 # --- update notes -------------------------------------------------------------
@@ -595,24 +921,115 @@ def notes_for_update(repo, target_commit, current_commit):
     return [line.strip() for line in message.splitlines() if line.strip()]
 
 
-def list_versions(repo_path, number_versions, release_only):
-    """Version history from local tags, in the launcher's response format."""
+def _version_entry(kind, version, title, commit, relation, update_note, previous=None):
+    return {
+        "version": version,
+        "previous_version": previous,
+        "update_note": update_note,
+        "kind": kind,
+        "title": title,
+        "commit": commit.decode("ascii"),
+        "relation": relation,
+    }
+
+
+def _commit_time(repo, commit):
+    try:
+        return repo[commit].commit_time
+    except Exception:
+        return 0
+
+
+def list_branch_versions(repo, pulls=()):
+    """The branch versions of a plain clone, from already fetched refs.
+
+    In order: the remote's default branch, the local branches (the checked-out
+    one first, then the most recently committed) and the pull requests in
+    ``pulls``, given as ``[(number, title)]``.
+    """
+    try:
+        head = repo.head()
+    except KeyError:
+        head = None
+    current_branch = head_branch(repo)
+
+    def entry(kind, version, title, commit, on_branches=None):
+        relation = commit_relation(repo, head, commit)
+        # The checked-out commit through another branch is still a switch.
+        if relation == RELATION_CURRENT and on_branches and current_branch not in on_branches:
+            relation = RELATION_OTHER
+        return _version_entry(
+            kind, version, title, commit, relation, notes_for_update(repo, commit, head)
+        )
+
+    versions = []
+    default = default_branch(repo)
+    if default:
+        try:
+            commit = branch_target(repo, default)
+        except StandaloneUpdateError:
+            # Diverged: list the remote tip; updating to it reports the reason.
+            commit = repo.refs[REMOTE_BRANCH_PREFIX + default.encode("utf-8")]
+        versions.append(entry(KIND_BRANCH, default, default, commit, (None, default)))
+
+    branches = [
+        (name.decode("utf-8", "replace"), commit)
+        for name, commit in repo.refs.as_dict(BRANCH_PREFIX).items()
+    ]
+    branches = sorted(
+        (item for item in branches if item[0] != default),
+        key=lambda item: (item[0] != current_branch, -_commit_time(repo, item[1]), item[0]),
+    )
+    for name, commit in branches[:MAX_LOCAL_BRANCHES]:
+        versions.append(entry(
+            KIND_LOCAL, LOCAL_VERSION_PREFIX + name, "{} (local)".format(name), commit, (name,)
+        ))
+
+    for number, title in pulls:
+        commit = _ref(repo, _pull_ref(number))
+        if commit is not None:
+            versions.append(entry(
+                KIND_PULL,
+                "{}{}".format(PULL_VERSION_PREFIX, number),
+                "#{} {}".format(number, title).strip(),
+                commit,
+            ))
+    return versions
+
+
+def list_versions(repo_path, number_versions, release_only, pulls=()):
+    """Version history from local refs, in the launcher's response format.
+
+    Each entry also has its ``kind``, a ``title`` to show, its ``commit`` and
+    its ``relation`` to the checked-out commit. A plain clone that also wants
+    test versions lists its branches and ``pulls`` before the version tags; see
+    :func:`list_branch_versions`.
+    """
     with open_repo(repo_path) as repo:
+        versions = []
+        if not release_only and not is_launcher_layout(repo_path):
+            versions.extend(list_branch_versions(repo, pulls))
+        try:
+            head = repo.head()
+        except KeyError:
+            head = None
         tags = local_version_tags(repo)
         if release_only:
             tags = [tag for tag in tags if is_release_version(tag)]
-        versions = []
         for index, version in enumerate(tags[:number_versions]):
             previous = tags[index + 1] if index + 1 < len(tags) else None
-            versions.append({
-                "version": version,
-                "previous_version": previous,
-                "update_note": collect_commit_messages(
-                    repo,
-                    tag_commit(repo, version),
-                    tag_commit(repo, previous) if previous else None,
+            commit = tag_commit(repo, version)
+            versions.append(_version_entry(
+                KIND_TAG,
+                version,
+                version,
+                commit,
+                commit_relation(repo, head, commit),
+                collect_commit_messages(
+                    repo, commit, tag_commit(repo, previous) if previous else None
                 ),
-            })
+                previous,
+            ))
         return versions
 
 
@@ -728,6 +1145,30 @@ def requirements_at(repo, commit_id, profile_name=None):
 # --- public entry points --------------------------------------------------------
 
 
+def detect_app_checkout(start_dir=None):
+    """Return the checkout's version and plain-clone ref label, or None values."""
+    try:
+        repo_path = find_repo_path(start_dir)
+        with open_repo(repo_path) as repo:
+            version = head_version(repo)
+            ref = None if is_launcher_layout(repo_path) else head_ref(repo)
+            return version, ref
+    except Exception:
+        return None, None
+
+
+def detect_app_ref(start_dir=None):
+    """Return the plain clone's branch or pull request label, or None."""
+    try:
+        repo_path = find_repo_path(start_dir)
+        if is_launcher_layout(repo_path):
+            return None
+        with open_repo(repo_path) as repo:
+            return head_ref(repo)
+    except Exception:
+        return None
+
+
 def detect_app_version(start_dir=None):
     """Return the version tag at HEAD of the app's checkout, or None."""
     try:
@@ -737,11 +1178,23 @@ def detect_app_version(start_dir=None):
         return None
 
 
+def is_plain_checkout(start_dir=None):
+    """Return whether the app runs from a plain git clone, not the launcher's layout."""
+    try:
+        return not is_launcher_layout(find_repo_path(start_dir))
+    except Exception:
+        return False
+
+
 def get_version_list(number_versions=10, release_only=True, timeout=120, exit_event=None):
     repo_path = find_repo_path()
     _fetch_tags_logged(repo_path, timeout, exit_event)
+    pulls = ()
+    if not release_only and not is_launcher_layout(repo_path):
+        _process._raise_if_exit_requested(exit_event)
+        pulls = _fetch_branches_logged(repo_path, timeout, exit_event)
     _process._raise_if_exit_requested(exit_event)
-    return list_versions(repo_path, number_versions, release_only)
+    return list_versions(repo_path, number_versions, release_only, pulls)
 
 
 def update_to_version(
@@ -754,19 +1207,28 @@ def update_to_version(
     """
     log = get_logger()
     repo_path = find_repo_path()
-    _fetch_tags_logged(repo_path, timeout, exit_event)
+    managed = is_launcher_layout(repo_path)
+    kind = KIND_TAG if managed else version_kind(version)
+    # A local branch needs nothing from the remote, so it also works offline.
+    if kind != KIND_LOCAL:
+        _fetch_tags_logged(repo_path, timeout, exit_event)
+        if kind != KIND_TAG:
+            _process._raise_if_exit_requested(exit_event)
+            pull_numbers = [int(version[len(PULL_VERSION_PREFIX):])] if kind == KIND_PULL else []
+            _fetch_branches_logged(repo_path, timeout, exit_event, pull_numbers)
     _process._raise_if_exit_requested(exit_event)
 
     with open_repo(repo_path) as repo:
-        target_commit = tag_commit(repo, version)
+        _kind, target_commit, _branch = resolve_version(repo, version, tags_only=managed)
         # The launcher's layout is managed: tracked files are forced to the new
         # version, as the launcher does. A plain clone may hold the user's work.
-        if not is_launcher_layout(repo_path) and has_local_changes(repo):
+        if not managed and has_local_changes(repo):
             raise StandaloneUpdateError(
                 "Cannot update {}: tracked files have local changes. Commit or "
                 "stash them first.".format(repo_path)
             )
         current_commit = repo.head()
+        previous_ref = _followed_ref(repo, HEAD_REF)
         previous_version = app_version or head_version(repo)
         if previous_version == version:
             update_note = []
@@ -779,6 +1241,8 @@ def update_to_version(
         "version": version,
         "previous_version": previous_version,
         "previous_commit": current_commit.decode("ascii"),
+        # The branch that was checked out, restored if the update fails.
+        "previous_ref": previous_ref.decode("utf-8") if previous_ref else None,
         "update_note": update_note,
         "profile": app_profile,
         "pid": os.getpid(),

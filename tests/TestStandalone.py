@@ -56,6 +56,10 @@ def read(path):
         return file.read()
 
 
+def tag_versions(versions):
+    return [version for version in versions if version["kind"] == "tag"]
+
+
 class TestVersionTags(unittest.TestCase):
     def test_sorts_like_the_launcher(self):
         tags = ["v1.0.0", "notes", "v1.1.0-beta", "v1.1.0", "1.1.0-rc.2", "v1.1.0.rc", "v1.1.0-alpha.1"]
@@ -168,12 +172,13 @@ class TestStandaloneVersionList(StandaloneRepoTestCase):
             versions = pyappify.get_version_list(release_only=False)
 
         run.assert_not_called()
+        versions = tag_versions(versions)
         self.assertEqual(["v1.1.0", "v1.1.0-beta", "v1.0.0"], [v["version"] for v in versions])
         self.assertEqual("v1.1.0-beta", versions[0]["previous_version"])
         self.assertIsNone(versions[2]["previous_version"])
 
     def test_notes_skip_merges_and_split_message_lines(self):
-        versions = pyappify.get_version_list(release_only=False)
+        versions = tag_versions(pyappify.get_version_list(release_only=False))
 
         self.assertCountEqual(["Release 1.1.0", "Side change"], versions[0]["update_note"])
         self.assertEqual(["Beta feature", "More detail"], versions[1]["update_note"])
@@ -190,7 +195,7 @@ class TestStandaloneVersionList(StandaloneRepoTestCase):
         self.add_remote_release("v1.2.0", orphan=True)
         git(self.remote, "tag", "-d", "v1.1.0-beta")
 
-        versions = pyappify.get_version_list(number_versions=2, release_only=False)
+        versions = tag_versions(pyappify.get_version_list(number_versions=2, release_only=False))
 
         self.assertEqual(["v1.2.0", "v1.1.0"], [v["version"] for v in versions])
         self.assertEqual("v1.0.0", versions[1]["previous_version"])
@@ -398,6 +403,293 @@ class TestStandaloneUpdater(StandaloneRepoTestCase):
         )
 
 
+class TestBranchVersions(StandaloneRepoTestCase):
+    """The default branch, local branches and pull requests of a plain clone."""
+
+    def setUp(self):
+        super().setUp()
+        # The clone is at v1.0.0; the remote gets a commit and a pull request.
+        git(self.clone, "branch", "feature", "v1.1.0-beta")
+        self.commit_file("app.txt", "main\n", "Unreleased work")
+        git(self.remote, "checkout", "-q", "-b", "pull", "v1.1.0")
+        self.commit_file("pull.txt", "pull\n", "Proposed change")
+        git(self.remote, "update-ref", "refs/pull/7/head", "HEAD")
+        git(self.remote, "checkout", "-q", "main")
+        git(self.remote, "branch", "-q", "-D", "pull")
+        pulls = mock.patch.object(
+            standalone, "list_pull_requests", return_value=[(7, "Add a thing")]
+        )
+        pulls.start()
+        self.addCleanup(pulls.stop)
+
+    def ref(self, name):
+        with standalone.open_repo(self.clone) as repo:
+            return repo.refs[name]
+
+    def head_branch(self):
+        with standalone.open_repo(self.clone) as repo:
+            return standalone.head_branch(repo)
+
+    def job(self, version, **overrides):
+        job = {
+            "repo_path": self.clone,
+            "version": version,
+            "previous_version": "v1.0.0",
+            "previous_commit": self.head().decode(),
+            "previous_ref": None,
+            "update_note": ["note"],
+            "profile": "Global",
+            "pid": None,
+            "relaunch": {"argv": None, "cwd": self.clone, "pythonpath": None},
+        }
+        job.update(overrides)
+        return job
+
+    def written_job(self, start):
+        """The job passed to the updater, without this process as the app to stop."""
+        job = json.loads(read(start.call_args.args[0]))
+        self.assertEqual(os.getpid(), job["pid"])
+        job["pid"] = None
+        return job
+
+    def run_job(self, job, pip_error=None):
+        log = mock.Mock()
+        with mock.patch.object(
+            standalone_updater, "pip_install", side_effect=pip_error
+        ), mock.patch.object(standalone_updater, "relaunch") as relaunch:
+            succeeded = standalone_updater.run_job(job, log)
+        return succeeded, relaunch, log
+
+    def test_detect_checkout_ref_branch_and_tag(self):
+        self.assertIsNone(standalone.detect_app_ref(self.clone))
+        git(self.clone, "checkout", "-q", "feature")
+        for packed in (False, True):
+            if packed:
+                git(self.clone, "pack-refs", "--all")
+            with standalone.open_repo(self.clone) as repo:
+                with mock.patch.object(repo.refs, "follow", side_effect=AssertionError("resolved HEAD")):
+                    self.assertEqual("feature", standalone.head_ref(repo))
+            self.assertEqual("feature", standalone.detect_app_ref(self.clone))
+        git(self.clone, "checkout", "-q", "v1.0.0")
+        self.assertIsNone(standalone.detect_app_ref(self.clone))
+
+    def test_detect_checkout_ref_pull_loose_and_packed(self):
+        standalone.fetch_branches(self.clone, [7])
+        git(self.clone, "checkout", "-q", "--detach", "refs/pyappify/pull/7")
+        self.assertEqual("pr#7", standalone.detect_app_ref(self.clone))
+        git(self.clone, "pack-refs", "--all")
+        self.assertEqual("pr#7", standalone.detect_app_ref(self.clone))
+        git(self.clone, "update-ref", "refs/pyappify/pull/7", "v1.0.0")
+        self.assertIsNone(standalone.detect_app_ref(self.clone))
+
+    def test_detect_checkout_ref_launcher_and_errors(self):
+        with mock.patch.object(standalone, "is_launcher_layout", return_value=True):
+            self.assertIsNone(standalone.detect_app_ref(self.clone))
+        with mock.patch.object(standalone, "_dulwich", side_effect=ImportError("no dulwich")):
+            self.assertIsNone(standalone.detect_app_ref(self.clone))
+            self.assertEqual((None, None), standalone.detect_app_checkout(self.clone))
+
+    def test_lists_default_branch_local_branches_pull_requests_then_tags(self):
+        versions = pyappify.get_version_list(release_only=False)
+
+        self.assertEqual(
+            ["main", "local/feature", "pr/7", "v1.1.0", "v1.1.0-beta", "v1.0.0"],
+            [v["version"] for v in versions],
+        )
+        self.assertEqual(
+            ["main", "feature (local)", "#7 Add a thing", "v1.1.0", "v1.1.0-beta", "v1.0.0"],
+            [v["title"] for v in versions],
+        )
+        self.assertEqual(
+            ["branch", "local", "pr", "tag", "tag", "tag"], [v["kind"] for v in versions]
+        )
+        self.assertEqual(
+            ["newer", "newer", "newer", "newer", "newer", "current"],
+            [v["relation"] for v in versions],
+        )
+        self.assertEqual(self.ref(b"refs/remotes/origin/main").decode(), versions[0]["commit"])
+        self.assertIn("Unreleased work", versions[0]["update_note"])
+        self.assertEqual(["Beta feature", "More detail"], versions[1]["update_note"])
+        self.assertIn("Proposed change", versions[2]["update_note"])
+
+    def test_release_only_lists_tags_only(self):
+        versions = pyappify.get_version_list(release_only=True)
+
+        self.assertEqual(["v1.1.0", "v1.0.0"], [v["version"] for v in versions])
+
+    def test_checked_out_branch_is_current_and_listed_first(self):
+        git(self.clone, "branch", "other", "v1.1.0")
+        git(self.clone, "checkout", "-q", "feature")
+
+        versions = pyappify.get_version_list(release_only=False)
+
+        self.assertEqual(["main", "local/feature", "local/other"], [v["version"] for v in versions[:3]])
+        self.assertEqual("current", versions[1]["relation"])
+        # v1.1.0-beta is the same commit, and a tag is not a branch to switch to.
+        self.assertEqual("current", versions[-2]["relation"])
+        self.assertEqual("older", versions[-1]["relation"])
+
+    def test_closed_pull_requests_are_pruned(self):
+        pyappify.get_version_list(release_only=False)
+        standalone.list_pull_requests.return_value = []
+
+        versions = pyappify.get_version_list(release_only=False)
+
+        self.assertNotIn("pr", [v["kind"] for v in versions])
+        with standalone.open_repo(self.clone) as repo:
+            self.assertEqual({}, repo.refs.as_dict(standalone.LOCAL_PULL_PREFIX))
+
+    def test_failing_pull_request_lookup_still_lists_branches(self):
+        standalone.list_pull_requests.side_effect = OSError("rate limited")
+
+        versions = pyappify.get_version_list(release_only=False)
+
+        self.assertEqual(["main", "local/feature", "v1.1.0"], [v["version"] for v in versions[:3]])
+
+    def test_update_to_default_branch_fast_forwards_the_local_branch(self):
+        with mock.patch.object(standalone, "_start_updater") as start:
+            pyappify.update_to_version("main")
+        job = self.written_job(start)
+        self.assertIsNone(job["previous_ref"])
+
+        succeeded, relaunch, _log = self.run_job(job)
+
+        self.assertTrue(succeeded)
+        self.assertEqual("main", self.head_branch())
+        self.assertEqual(self.ref(b"refs/remotes/origin/main"), self.head())
+        self.assertEqual("main\n", read(os.path.join(self.clone, "app.txt")))
+        self.assertEqual(
+            {
+                "PYAPPIFY_APP_VERSION": None,
+                "PYAPPIFY_APP_STARTING_VERSION": None,
+                "PYAPPIFY_UPDATE_NOTE": None,
+            },
+            relaunch.call_args.args[1],
+        )
+
+    def test_default_branch_keeps_unpushed_commits(self):
+        git(self.clone, "checkout", "-q", "main")
+        standalone.fetch_branches(self.clone)
+        git(self.clone, "merge", "-q", "--ff-only", "origin/main")
+        write(os.path.join(self.clone, "mine.txt"), "mine\n")
+        git(self.clone, "add", "-A")
+        git(self.clone, "commit", "-q", "-m", "Local work")
+        local = self.head()
+
+        versions = pyappify.get_version_list(release_only=False)
+        self.assertEqual(("main", "current"), (versions[0]["version"], versions[0]["relation"]))
+
+        self.commit_file("app.txt", "main 2\n", "More remote work")
+        with mock.patch.object(standalone, "_start_updater") as start:
+            with self.assertRaisesRegex(standalone.StandaloneUpdateError, "diverged"):
+                pyappify.update_to_version("main")
+        start.assert_not_called()
+        self.assertEqual(local, self.head())
+
+    def test_update_to_local_branch_needs_no_fetch(self):
+        with mock.patch.object(standalone, "fetch_tags") as fetch_tags, \
+                mock.patch.object(standalone, "fetch_branches") as fetch_branches, \
+                mock.patch.object(standalone, "_start_updater") as start:
+            pyappify.update_to_version("local/feature")
+        fetch_tags.assert_not_called()
+        fetch_branches.assert_not_called()
+
+        succeeded, _relaunch, _log = self.run_job(self.written_job(start))
+
+        self.assertTrue(succeeded)
+        self.assertEqual("feature", self.head_branch())
+        self.assertEqual(self.tag_commit("v1.1.0-beta"), self.head())
+        self.assertEqual("1.1.0-beta\n", read(os.path.join(self.clone, "app.txt")))
+
+    def test_update_to_pull_request_detaches_head(self):
+        git(self.clone, "checkout", "-q", "feature")
+        with mock.patch.object(standalone, "_start_updater") as start:
+            pyappify.update_to_version("pr/7")
+        job = self.written_job(start)
+        self.assertEqual("refs/heads/feature", job["previous_ref"])
+
+        succeeded, _relaunch, _log = self.run_job(job)
+
+        self.assertTrue(succeeded)
+        self.assertIsNone(self.head_branch())
+        self.assertEqual(self.ref(b"refs/pyappify/pull/7"), self.head())
+        self.assertEqual("pull\n", read(os.path.join(self.clone, "pull.txt")))
+        self.assertEqual(self.tag_commit("v1.1.0-beta"), self.ref(b"refs/heads/feature"))
+
+    def test_unknown_versions_are_rejected(self):
+        for version in ("local/missing", "pr/99", "no-such-branch"):
+            with mock.patch.object(standalone, "_start_updater") as start:
+                with self.assertRaises(standalone.StandaloneUpdateError):
+                    pyappify.update_to_version(version)
+            start.assert_not_called()
+
+    def test_failed_update_returns_to_the_previous_branch(self):
+        git(self.clone, "checkout", "-q", "feature")
+        self.add_remote_release("v1.2.0", requirements="six==1.17.0\n")
+        standalone.fetch_tags(self.clone)
+        before = self.head()
+
+        succeeded, _relaunch, _log = self.run_job(
+            self.job("v1.2.0", previous_ref="refs/heads/feature"),
+            pip_error=standalone.StandaloneUpdateError("pip failed"),
+        )
+
+        self.assertFalse(succeeded)
+        self.assertEqual("feature", self.head_branch())
+        self.assertEqual(before, self.head())
+        self.assertEqual("1.1.0-beta\n", read(os.path.join(self.clone, "app.txt")))
+
+    def test_requirements_are_synced_for_a_branch(self):
+        write(os.path.join(self.remote, "requirements.txt"), "six==1.17.0\n")
+        self.commit("Bump six")
+        standalone.fetch_branches(self.clone)
+        log = mock.Mock()
+
+        with mock.patch.object(standalone_updater, "pip_install") as pip, \
+                mock.patch.object(standalone_updater, "relaunch"):
+            succeeded = standalone_updater.run_job(self.job("main"), log)
+
+        self.assertTrue(succeeded)
+        pip.assert_called_once_with(self.clone, "requirements.txt", "--no-deps", mock.ANY)
+
+    def test_is_local_checkout(self):
+        self.assertTrue(pyappify.is_local_checkout())
+        pyappify.pyappify_version = "1.2.5"
+        self.assertFalse(pyappify.is_local_checkout())
+
+
+class TestGitHubRemote(unittest.TestCase):
+    def test_recognizes_github_urls(self):
+        for url in (
+            "https://github.com/owner/app",
+            "https://github.com/owner/app.git",
+            "https://user@github.com/owner/app.git/",
+            "git@github.com:owner/app.git",
+            "ssh://git@github.com/owner/app",
+        ):
+            self.assertEqual(("owner", "app"), standalone.github_repository(url), url)
+        for url in ("https://gitlab.com/owner/app.git", "https://github.com/owner", "/local/path", ""):
+            self.assertIsNone(standalone.github_repository(url), url)
+
+    def test_lists_open_pull_requests(self):
+        body = json.dumps([
+            {"number": 12, "title": " Fix start "},
+            {"number": 9, "title": None},
+        ]).encode()
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = body
+        with mock.patch.object(standalone.urllib.request, "urlopen", return_value=response) as urlopen:
+            pulls = standalone.list_pull_requests("https://github.com/owner/app.git")
+            self.assertEqual([], standalone.list_pull_requests("https://example.invalid/app.git"))
+
+        self.assertEqual([(12, "Fix start"), (9, "")], pulls)
+        urlopen.assert_called_once()
+        self.assertEqual(
+            "https://api.github.com/repos/owner/app/pulls?state=open&per_page=10",
+            urlopen.call_args.args[0].full_url,
+        )
+
+
 def copy_without_git(source, destination):
     """What older launchers did: copy the clone's files into ``working``."""
     shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".git"))
@@ -481,6 +773,15 @@ class TestLauncherLayout(StandaloneRepoTestCase):
         self.assertTrue(succeeded)
         pip.assert_not_called()
         self.assert_updated_with_app_files_kept()
+
+    def test_lists_only_tags(self):
+        self.make_bare_layout()
+
+        versions = standalone.list_versions(self.repo, 10, False)
+
+        self.assertEqual(["tag"] * 3, [v["kind"] for v in versions])
+        self.assertEqual("current", versions[-1]["relation"])
+        self.assertFalse(standalone.is_plain_checkout(self.working))
 
     def test_update_request_uses_a_state_dir_outside_repo(self):
         self.make_bare_layout()
