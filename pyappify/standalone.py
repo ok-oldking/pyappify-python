@@ -296,14 +296,84 @@ def tag_commit(repo, tag_name):
         raise StandaloneUpdateError("Version tag '{}' does not exist.".format(tag_name))
 
 
+def _read_tag_targets(repo):
+    """Return ``{tag name: (sha, peeled commit or None)}`` in one pass over the refs.
+
+    Dulwich re-parses ``packed-refs`` for every ref it resolves, which takes
+    seconds in a repository with a thousand tags, so the file is read once here.
+    A missing peeled commit means the sha still has to be peeled.
+    """
+    git_dir = repo.commondir()
+    targets = {}
+    try:
+        with open(os.path.join(git_dir, "packed-refs"), "rb") as packed:
+            lines = packed.read().splitlines()
+    except OSError:
+        lines = []
+    fully_peeled = bool(lines) and lines[0].startswith(b"#") and b"fully-peeled" in lines[0]
+    last = None
+    for line in lines:
+        if line.startswith(b"#") or not line.strip():
+            continue
+        if line.startswith(b"^"):
+            if last is not None:
+                targets[last] = (targets[last][0], line[1:].strip())
+            continue
+        sha, _, ref = line.partition(b" ")
+        ref = ref.strip()
+        if not ref.startswith(TAG_PREFIX):
+            last = None
+            continue
+        last = ref[len(TAG_PREFIX):].decode("utf-8", "replace")
+        # In a fully-peeled file a tag without a "^" line already names its commit.
+        targets[last] = (sha, sha if fully_peeled else None)
+
+    tags_dir = os.path.join(git_dir, "refs", "tags")
+    for folder, _dirs, files in os.walk(tags_dir):
+        for file_name in files:
+            path = os.path.join(folder, file_name)
+            try:
+                with open(path, "rb") as loose:
+                    sha = loose.read().strip()
+            except OSError:
+                continue
+            name = os.path.relpath(path, tags_dir).replace(os.sep, "/")
+            targets[name] = (sha, None)  # a loose ref overrides a packed one
+    return targets
+
+
+def _peel_to_commit(repo, sha):
+    """Follow annotated tag objects from ``sha`` to the object they name."""
+    obj = repo[sha]
+    while obj.type_name == b"tag":
+        sha = obj.object[1]
+        obj = repo[sha]
+    return sha
+
+
 def head_version(repo):
     """Return the newest version tag at HEAD, or None."""
     try:
         head = repo.head()
     except KeyError:
         return None
-    for tag in local_version_tags(repo):
-        if tag_commit(repo, tag) == head:
+    try:
+        targets = _read_tag_targets(repo)
+    except Exception:
+        targets = None
+    if targets is None:
+        for tag in local_version_tags(repo):
+            if tag_commit(repo, tag) == head:
+                return tag
+        return None
+    for tag in sort_version_tags(targets):
+        sha, peeled = targets[tag]
+        if peeled is None:
+            try:
+                peeled = _peel_to_commit(repo, sha)
+            except Exception:
+                continue
+        if peeled == head:
             return tag
     return None
 
