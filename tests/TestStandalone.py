@@ -191,44 +191,69 @@ class TestStandaloneVersionList(StandaloneRepoTestCase):
         self.assertEqual("v1.0.0", versions[0]["previous_version"])
         self.assertIn("Beta feature", versions[0]["update_note"])
 
-    def test_fetches_new_tags_including_ones_off_branches_and_prunes_deleted(self):
+    def test_fetches_new_tags_including_ones_off_branches(self):
         self.add_remote_release("v1.2.0", orphan=True)
-        git(self.remote, "tag", "-d", "v1.1.0-beta")
 
         versions = tag_versions(pyappify.get_version_list(number_versions=2, release_only=False))
 
         self.assertEqual(["v1.2.0", "v1.1.0"], [v["version"] for v in versions])
-        self.assertEqual("v1.0.0", versions[1]["previous_version"])
+        self.assertEqual("v1.1.0-beta", versions[1]["previous_version"])
 
     def local_tags(self):
         with standalone.open_repo(self.clone) as repo:
             return sorted(name.decode() for name in repo.refs.as_dict(standalone.TAG_PREFIX))
 
-    def test_keep_releases_from_repo_config_fetches_only_kept_tags(self):
+    def test_plain_clone_keeps_every_tag(self):
+        """A developer's clone ignores keep_releases and loses no tag."""
         git(self.clone, "config", "pyappify.keepreleases", "1")
-        self.add_remote_release("v1.2.0")
-        self.add_remote_release("v1.3.0-beta")
-
-        standalone.fetch_tags(self.clone)
-
-        # v1.0.0 stays because it is checked out.
-        self.assertEqual(["v1.0.0", "v1.2.0", "v1.3.0-beta"], self.local_tags())
-
-    def test_keep_releases_from_pyappify_yml_at_head(self):
         write(
             os.path.join(self.remote, "pyappify.yml"),
             "keep_releases: 1\n" + PYAPPIFY_YML,
         )
         self.add_remote_release("v1.2.0")
+        self.add_remote_release("v1.3.0-beta")
         git(self.clone, "fetch", "-q", "--tags")
         git(self.clone, "checkout", "-q", "v1.2.0")
+        git(self.clone, "tag", "v9.9.9-local")
+        git(self.remote, "tag", "-d", "v1.1.0-beta")
+        self.add_remote_release("v1.3.0")
 
-        standalone.fetch_tags(self.clone)
+        updated, pruned = standalone.fetch_tags(self.clone)
 
-        self.assertEqual(["v1.2.0"], self.local_tags())
+        self.assertEqual((["v1.3.0"], []), (updated, pruned))
+        self.assertEqual(
+            ["v1.0.0", "v1.1.0", "v1.1.0-beta", "v1.2.0", "v1.3.0", "v1.3.0-beta", "v9.9.9-local"],
+            self.local_tags(),
+        )
 
     def test_detects_version_tag_at_head(self):
         self.assertEqual("v1.0.0", standalone.detect_app_version())
+
+    def lock_new_tag(self, age_seconds):
+        """A lock on a tag the next fetch writes, as an app killed mid-fetch leaves."""
+        self.add_remote_release("v1.2.0")
+        lock = os.path.join(self.clone, ".git", "refs", "tags", "v1.2.0.lock")
+        write(lock, "")
+        modified = time.time() - age_seconds
+        os.utime(lock, (modified, modified))
+        return lock
+
+    def test_stale_ref_lock_is_removed(self):
+        lock = self.lock_new_tag(age_seconds=3600)
+
+        updated, _pruned = standalone.fetch_tags(self.clone)
+
+        self.assertEqual(["v1.2.0"], updated)
+        self.assertEqual(["v1.0.0", "v1.1.0", "v1.1.0-beta", "v1.2.0"], self.local_tags())
+        self.assertFalse(os.path.exists(lock))
+
+    def test_fresh_ref_lock_is_reported(self):
+        lock = self.lock_new_tag(age_seconds=0)
+
+        with self.assertRaisesRegex(standalone.StandaloneUpdateError, "another process"):
+            standalone.fetch_tags(self.clone)
+
+        self.assertTrue(os.path.exists(lock))
 
 
 class TestStandaloneUpdateRequest(StandaloneRepoTestCase):
@@ -753,6 +778,47 @@ class TestLauncherLayout(StandaloneRepoTestCase):
         self.assertFalse(os.path.exists(os.path.join(self.working, ".git")))
         with standalone.open_repo(self.repo) as repo:
             self.assertEqual("v1.1.0", standalone.head_version(repo))
+
+    def layout_tags(self):
+        with standalone.open_repo(self.repo) as repo:
+            return sorted(name.decode() for name in repo.refs.as_dict(standalone.TAG_PREFIX))
+
+    def checkout_layout(self, version):
+        git(self.root, "--git-dir", self.repo, "--work-tree", self.working, "checkout", "-q", "-f", version)
+
+    def test_mirrors_tags_and_prunes_deleted(self):
+        self.make_bare_layout()
+        self.add_remote_release("v1.2.0", orphan=True)
+        git(self.remote, "tag", "-d", "v1.1.0-beta")
+
+        updated, pruned = standalone.fetch_tags(self.repo)
+
+        self.assertEqual((["v1.2.0"], ["v1.1.0-beta"]), (updated, pruned))
+        self.assertEqual(["v1.0.0", "v1.1.0", "v1.2.0"], self.layout_tags())
+
+    def test_keep_releases_from_repo_config_fetches_only_kept_tags(self):
+        self.make_bare_layout()
+        git(self.root, "--git-dir", self.repo, "config", "pyappify.keepreleases", "1")
+        self.add_remote_release("v1.2.0")
+        self.add_remote_release("v1.3.0-beta")
+
+        standalone.fetch_tags(self.repo)
+
+        # v1.0.0 stays because it is checked out.
+        self.assertEqual(["v1.0.0", "v1.2.0", "v1.3.0-beta"], self.layout_tags())
+
+    def test_keep_releases_from_pyappify_yml_at_head(self):
+        write(
+            os.path.join(self.remote, "pyappify.yml"),
+            "keep_releases: 1\n" + PYAPPIFY_YML,
+        )
+        self.add_remote_release("v1.2.0")
+        self.make_bare_layout()
+        self.checkout_layout("v1.2.0")
+
+        standalone.fetch_tags(self.repo)
+
+        self.assertEqual(["v1.2.0"], self.layout_tags())
 
     def test_finds_repo_from_inside_working(self):
         self.make_bare_layout()

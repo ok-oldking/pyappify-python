@@ -63,6 +63,7 @@ PULL_VERSION_PREFIX = "pr/"
 MAX_LOCAL_BRANCHES = 10
 MAX_PULL_REQUESTS = 10
 PULL_REQUEST_TIMEOUT_SECONDS = 15
+STALE_LOCK_SECONDS = 60
 
 # How a listed version relates to the checked-out commit.
 RELATION_CURRENT = "current"
@@ -575,14 +576,55 @@ def resolve_version(repo, version, tags_only=False):
     return KIND_TAG, tag_commit(repo, version), None
 
 
+def _with_ref_lock(operation):
+    """Run a ref update, removing a lock file that a killed process left behind.
+
+    Dulwich, like git, takes ``<ref>.lock`` for every ref it writes. An app
+    closed in the middle of a fetch leaves that file, and every later update
+    of the ref would fail. A lock younger than ``STALE_LOCK_SECONDS`` may be
+    another process at work and is reported instead.
+    """
+    from dulwich.file import FileLocked
+
+    try:
+        return operation()
+    except FileLocked as error:
+        lock = os.fsdecode(error.lockfilename)
+        try:
+            age = time.time() - os.path.getmtime(lock)
+        except OSError:
+            age = None  # released in the meantime
+        if age is not None:
+            if age < STALE_LOCK_SECONDS:
+                raise StandaloneUpdateError(
+                    "The repository is being changed by another process ({} exists). "
+                    "Try again in a moment.".format(lock)
+                )
+            get_logger().warning("pyappify removing stale lock %s", lock)
+            os.remove(lock)
+        return operation()
+
+
+def set_ref(repo, ref, sha):
+    _with_ref_lock(lambda: repo.refs.__setitem__(ref, sha))
+
+
+def delete_ref(repo, ref):
+    _with_ref_lock(lambda: repo.refs.__delitem__(ref))
+
+
+def set_symbolic_ref(repo, ref, target):
+    _with_ref_lock(lambda: repo.refs.set_symbolic_ref(ref, target))
+
+
 def attach_branch(repo, branch, commit):
     """Point the local ``branch`` at ``commit`` and make it the checked-out branch.
 
     The work tree must already be at ``commit``.
     """
     ref = BRANCH_PREFIX + branch.encode("utf-8")
-    repo.refs[ref] = commit
-    repo.refs.set_symbolic_ref(HEAD_REF, ref)
+    set_ref(repo, ref, commit)
+    set_symbolic_ref(repo, HEAD_REF, ref)
 
 
 # --- fetching ---------------------------------------------------------------
@@ -651,20 +693,25 @@ def _remote_client(repo):
 
 
 def fetch_tags(repo_path, progress=None):
-    """Mirror the remote's tags, like ``git fetch origin +refs/tags/*:refs/tags/* --prune``.
+    """Fetch the remote's tags; return ``(updated, pruned)`` tag names.
 
-    With ``keep_releases`` (see :func:`keep_releases`) only the kept version
-    tags are fetched and kept locally, plus the tags of the checked-out commit.
-    Returns ``(updated, pruned)`` tag names.
+    The launcher's layout mirrors them, like ``git fetch origin
+    +refs/tags/*:refs/tags/* --prune``, and with ``keep_releases`` (see
+    :func:`keep_releases`) fetches and keeps only the kept version tags, plus
+    the tags of the checked-out commit.
+
+    A plain clone is a developer's own repository: every tag is fetched and
+    none is deleted, whatever ``keep_releases`` says.
     """
+    managed = is_launcher_layout(repo_path)
     with open_repo(repo_path) as repo:
         client, remote_path = _remote_client(repo)
 
         def is_tag(ref, sha):
             return ref.startswith(TAG_PREFIX) and not ref.endswith(PEELED_SUFFIX) and sha
 
-        keep = keep_releases(repo)
-        protected = head_tags(repo)
+        keep = keep_releases(repo) if managed else None
+        protected = head_tags(repo) if keep is not None else set()
 
         def wanted_tags(refs):
             """Remote tag names (bytes) to keep, mapped to their sha."""
@@ -702,12 +749,12 @@ def fetch_tags(repo_path, progress=None):
         updated = []
         for name, sha in remote_tags.items():
             if local_tags.get(name) != sha:
-                repo.refs[TAG_PREFIX + name] = sha
+                set_ref(repo, TAG_PREFIX + name, sha)
                 updated.append(name.decode("utf-8", "replace"))
         pruned = []
-        for name in local_tags:
+        for name in local_tags if managed else ():
             if name not in remote_tags:
-                del repo.refs[TAG_PREFIX + name]
+                delete_ref(repo, TAG_PREFIX + name)
                 pruned.append(name.decode("utf-8", "replace"))
         return updated, pruned
 
@@ -762,20 +809,20 @@ def fetch_branches(repo_path, pull_numbers=(), prune_pulls=False, progress=None)
         branch = None
         if branch_ref and refs[branch_ref] in repo.object_store:
             name = branch_ref[len(BRANCH_PREFIX):]
-            repo.refs[REMOTE_BRANCH_PREFIX + name] = refs[branch_ref]
-            repo.refs.set_symbolic_ref(REMOTE_HEAD_REF, REMOTE_BRANCH_PREFIX + name)
+            set_ref(repo, REMOTE_BRANCH_PREFIX + name, refs[branch_ref])
+            set_symbolic_ref(repo, REMOTE_HEAD_REF, REMOTE_BRANCH_PREFIX + name)
             branch = name.decode("utf-8", "replace")
 
         kept = set()
         for ref, number in pull_refs.items():
             sha = refs.get(ref)
             if sha and sha in repo.object_store:
-                repo.refs[_pull_ref(number)] = sha
+                set_ref(repo, _pull_ref(number), sha)
                 kept.add(b"%d" % number)
         if prune_pulls:
             for name in repo.refs.as_dict(LOCAL_PULL_PREFIX):
                 if name not in kept:
-                    del repo.refs[LOCAL_PULL_PREFIX + name]
+                    delete_ref(repo, LOCAL_PULL_PREFIX + name)
         return branch
 
 
