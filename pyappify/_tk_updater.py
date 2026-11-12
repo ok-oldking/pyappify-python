@@ -1114,12 +1114,13 @@ class UpdaterWindow:
         self.refresh_button.state(["disabled"])
 
         def local():
-            return standalone.list_versions(repo_path, NUMBER_VERSIONS, release_only)
+            return standalone.list_versions(repo_path, NUMBER_VERSIONS, release_only,
+                                            language=self.language)
 
         def remote():
             return standalone.get_version_list(
                 NUMBER_VERSIONS, release_only, timeout=120,
-                exit_event=self.exit_event, repo_path=repo_path,
+                exit_event=self.exit_event, repo_path=repo_path, language=self.language,
             )
 
         def show_local(versions):
@@ -1248,7 +1249,8 @@ class UpdaterWindow:
         else:
             heading = self.tr("changes_vs_installed")
         text.insert("end", heading + "\n", ("h2",))
-        notes = [str(note) for note in entry.get("update_note") or [] if str(note).strip()]
+        notes = (entry.get("localized_notes") or {}).get(self.language) or entry.get("update_note")
+        notes = [str(note) for note in notes or [] if str(note).strip()]
         if not notes:
             text.insert("end", self.tr("no_notes"), ("empty",))
         for note in notes:
@@ -1321,6 +1323,7 @@ class UpdaterWindow:
                     pid=session.get("pid"),
                     relaunch=session.get("relaunch"),
                     exit_timeout=session.get("exit_timeout", updater_ui.APP_EXIT_TIMEOUT_SECONDS),
+                    language=self.language,
                 )
             except Exception as error:
                 log.error("Could not prepare the update to %s: %s", version, error)

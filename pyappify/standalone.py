@@ -37,7 +37,7 @@ import types
 import urllib.request
 from contextlib import contextmanager
 
-from . import _process
+from . import _process, changelog, i18n
 from ._state import get_logger
 from .versions import is_release_version, is_version_tag, select_kept_tags, sort_version_tags
 
@@ -955,8 +955,8 @@ def collect_commit_messages(repo, target_commit, hidden_commit=None):
     return messages
 
 
-def notes_for_update(repo, target_commit, current_commit):
-    """Notes for moving from ``current_commit`` to ``target_commit``.
+def commit_notes_for_update(repo, target_commit, current_commit):
+    """Commit-message notes for moving from ``current_commit`` to ``target_commit``.
 
     Falls back to the target commit's own message when nothing new is reachable,
     for example on a downgrade, as the launcher does.
@@ -968,8 +968,103 @@ def notes_for_update(repo, target_commit, current_commit):
     return [line.strip() for line in message.splitlines() if line.strip()]
 
 
-def _version_entry(kind, version, title, commit, relation, update_note, previous=None):
-    return {
+def read_changelogs(repo, commit_id):
+    """``{language: parsed changelog}`` for the changelog files in ``commit_id``."""
+    changelogs = {}
+    for language in i18n.LANGUAGES:
+        data = read_file_at(repo, commit_id, changelog.changelog_path(language))
+        if data is not None:
+            changelogs[language] = changelog.parse_changelog(data.decode("utf-8-sig", "replace"))
+    return changelogs
+
+
+def version_tags_by_commit(repo):
+    """``{commit id: [version tag, ...]}``, each list newest first."""
+    try:
+        targets = _read_tag_targets(repo)
+    except Exception:
+        targets = None
+    tags = {}
+    for tag in (sort_version_tags(targets) if targets is not None else local_version_tags(repo)):
+        try:
+            if targets is None:
+                commit = tag_commit(repo, tag)
+            else:
+                sha, commit = targets[tag]
+                commit = commit if commit is not None else _peel_to_commit(repo, sha)
+        except Exception:
+            continue
+        tags.setdefault(commit, []).append(tag)
+    return tags
+
+
+def changelog_notes(repo, target_commit, hidden_commit, tags_by_commit, commit_notes):
+    """``{language: notes}`` for moving to ``target_commit``, or None without a changelog.
+
+    A language's notes come from the changelogs in ``target_commit`` (see
+    :mod:`pyappify.changelog`) when its version tag has an entry in that
+    language or in English: the entries of every version tag reachable from
+    ``target_commit`` but not from ``hidden_commit``, newest first, or the
+    target's own when nothing is (a downgrade). Other languages get
+    ``commit_notes()``. None when no language has an entry.
+    """
+    target_versions = list(tags_by_commit.get(target_commit) or ())
+    if not target_versions:
+        return None
+    changelogs = read_changelogs(repo, target_commit)
+    languages = [
+        language for language in i18n.LANGUAGES
+        if any(changelog.has_entry(changelogs, version, language) for version in target_versions)
+    ]
+    if not languages:
+        return None
+    versions = list(target_versions)
+    walker = repo.get_walker(
+        include=[target_commit],
+        exclude=[hidden_commit] if hidden_commit else None,
+        order=_dulwich().ORDER_DATE,
+    )
+    for entry in walker:
+        if entry.commit.id != target_commit:
+            versions.extend(tags_by_commit.get(entry.commit.id) or ())
+    fallback = None
+    notes = {}
+    for language in i18n.LANGUAGES:
+        if language in languages:
+            notes[language] = changelog.notes_for_versions(changelogs, versions, language)
+        else:
+            fallback = commit_notes() if fallback is None else fallback
+            notes[language] = fallback
+    return notes
+
+
+def _resolve_notes(repo, target_commit, hidden_commit, tags_by_commit, language, commit_notes):
+    """``(notes in language, {language: notes} or None)``: changelog, else commit messages."""
+    localized = changelog_notes(repo, target_commit, hidden_commit, tags_by_commit, commit_notes)
+    if localized is not None:
+        return localized[language] if language in localized else localized[changelog.ENGLISH], localized
+    return commit_notes(), None
+
+
+def notes_for_update(repo, target_commit, current_commit, language=None, tags_by_commit=None):
+    """Notes for moving from ``current_commit`` to ``target_commit`` in ``language``.
+
+    The changelog's notes when the target is a version with an entry, else
+    commit messages (see :func:`commit_notes_for_update`). ``language``
+    defaults to :func:`pyappify.i18n.resolve_language`.
+    """
+    notes, _localized = _resolve_notes(
+        repo, target_commit, current_commit,
+        version_tags_by_commit(repo) if tags_by_commit is None else tags_by_commit,
+        language or i18n.resolve_language(),
+        lambda: commit_notes_for_update(repo, target_commit, current_commit),
+    )
+    return notes
+
+
+def _version_entry(kind, version, title, commit, relation, notes, previous=None):
+    update_note, localized = notes
+    entry = {
         "version": version,
         "previous_version": previous,
         "update_note": update_note,
@@ -978,6 +1073,10 @@ def _version_entry(kind, version, title, commit, relation, update_note, previous
         "commit": commit.decode("ascii"),
         "relation": relation,
     }
+    if localized is not None:
+        # The changelog's notes in every language, to switch without listing again.
+        entry["localized_notes"] = localized
+    return entry
 
 
 def _commit_time(repo, commit):
@@ -987,7 +1086,7 @@ def _commit_time(repo, commit):
         return 0
 
 
-def list_branch_versions(repo, pulls=()):
+def list_branch_versions(repo, pulls=(), language=None, tags_by_commit=None):
     """The branch versions of a plain clone, from already fetched refs.
 
     In order: the remote's default branch, the local branches (the checked-out
@@ -999,15 +1098,20 @@ def list_branch_versions(repo, pulls=()):
     except KeyError:
         head = None
     current_branch = head_branch(repo)
+    language = language or i18n.resolve_language()
+    if tags_by_commit is None:
+        tags_by_commit = version_tags_by_commit(repo)
 
     def entry(kind, version, title, commit, on_branches=None):
         relation = commit_relation(repo, head, commit)
         # The checked-out commit through another branch is still a switch.
         if relation == RELATION_CURRENT and on_branches and current_branch not in on_branches:
             relation = RELATION_OTHER
-        return _version_entry(
-            kind, version, title, commit, relation, notes_for_update(repo, commit, head)
+        notes = _resolve_notes(
+            repo, commit, head, tags_by_commit, language,
+            lambda: commit_notes_for_update(repo, commit, head),
         )
+        return _version_entry(kind, version, title, commit, relation, notes)
 
     versions = []
     default = default_branch(repo)
@@ -1044,18 +1148,25 @@ def list_branch_versions(repo, pulls=()):
     return versions
 
 
-def list_versions(repo_path, number_versions, release_only, pulls=()):
+def list_versions(repo_path, number_versions, release_only, pulls=(), language=None):
     """Version history from local refs, in the launcher's response format.
 
     Each entry also has its ``kind``, a ``title`` to show, its ``commit`` and
     its ``relation`` to the checked-out commit. A plain clone that also wants
     test versions lists its branches and ``pulls`` before the version tags; see
     :func:`list_branch_versions`.
+
+    ``update_note`` is in ``language`` (default
+    :func:`pyappify.i18n.resolve_language`). An entry whose notes come from the
+    app's changelogs also has ``localized_notes``: ``{language: notes}`` for
+    every launcher language.
     """
+    language = language or i18n.resolve_language()
     with open_repo(repo_path) as repo:
+        tags_by_commit = version_tags_by_commit(repo)
         versions = []
         if not release_only and not is_launcher_layout(repo_path):
-            versions.extend(list_branch_versions(repo, pulls))
+            versions.extend(list_branch_versions(repo, pulls, language, tags_by_commit))
         try:
             head = repo.head()
         except KeyError:
@@ -1066,15 +1177,18 @@ def list_versions(repo_path, number_versions, release_only, pulls=()):
         for index, version in enumerate(tags[:number_versions]):
             previous = tags[index + 1] if index + 1 < len(tags) else None
             commit = tag_commit(repo, version)
+            previous_commit = tag_commit(repo, previous) if previous else None
+            notes = _resolve_notes(
+                repo, commit, previous_commit, tags_by_commit, language,
+                lambda: collect_commit_messages(repo, commit, previous_commit),
+            )
             versions.append(_version_entry(
                 KIND_TAG,
                 version,
                 version,
                 commit,
                 commit_relation(repo, head, commit),
-                collect_commit_messages(
-                    repo, commit, tag_commit(repo, previous) if previous else None
-                ),
+                notes,
                 previous,
             ))
         return versions
@@ -1234,7 +1348,8 @@ def is_plain_checkout(start_dir=None):
 
 
 def get_version_list(
-    number_versions=10, release_only=True, timeout=120, exit_event=None, repo_path=None
+    number_versions=10, release_only=True, timeout=120, exit_event=None, repo_path=None,
+    language=None,
 ):
     repo_path = repo_path or find_repo_path()
     _fetch_tags_logged(repo_path, timeout, exit_event)
@@ -1243,11 +1358,11 @@ def get_version_list(
         _process._raise_if_exit_requested(exit_event)
         pulls = _fetch_branches_logged(repo_path, timeout, exit_event)
     _process._raise_if_exit_requested(exit_event)
-    return list_versions(repo_path, number_versions, release_only, pulls)
+    return list_versions(repo_path, number_versions, release_only, pulls, language)
 
 
 def update_to_version(
-    version, timeout=300, exit_event=None, app_version=None, app_profile=None
+    version, timeout=300, exit_event=None, app_version=None, app_profile=None, language=None
 ):
     """Prepare an update to ``version`` and start the updater.
 
@@ -1265,6 +1380,7 @@ def update_to_version(
         app_profile=app_profile,
         pid=os.getpid(),
         relaunch=relaunch_info(),
+        language=language,
     )
     job_path = write_update_job(job)
     _process._raise_if_exit_requested(exit_event)
@@ -1288,10 +1404,12 @@ def prepare_update_job(
     pid=None,
     relaunch=None,
     exit_timeout=APP_EXIT_TIMEOUT_SECONDS,
+    language=None,
 ):
     """Fetch what ``version`` needs and return the updater job for it.
 
-    Nothing in the app's files changes yet. ``pid`` is the app process the
+    Nothing in the app's files changes yet. ``update_note`` is in ``language``
+    (default :func:`pyappify.i18n.resolve_language`). ``pid`` is the app process the
     updater stops first and ``relaunch`` (see :func:`relaunch_info`) how it
     restarts the app; without them the updater does neither.
     """
@@ -1322,7 +1440,7 @@ def prepare_update_job(
         if previous_version == version:
             update_note = []
         else:
-            update_note = notes_for_update(repo, target_commit, current_commit)
+            update_note = notes_for_update(repo, target_commit, current_commit, language)
 
     return {
         "repo_path": repo_path,
