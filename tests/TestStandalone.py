@@ -346,7 +346,9 @@ class TestStandaloneUpdater(StandaloneRepoTestCase):
         succeeded, pip, _relaunch = self.run_job(self.job("v1.2.0"))
 
         self.assertTrue(succeeded)
-        pip.assert_called_once_with(self.clone, "requirements.txt", "--no-deps", mock.ANY)
+        pip.assert_called_once_with(
+            self.clone, "requirements.txt", "--no-deps", mock.ANY, on_line=mock.ANY
+        )
 
     def test_rolls_back_when_pip_fails(self):
         self.add_remote_release("v1.2.0", requirements="six==1.17.0\n")
@@ -675,7 +677,9 @@ class TestBranchVersions(StandaloneRepoTestCase):
             succeeded = standalone_updater.run_job(self.job("main"), log)
 
         self.assertTrue(succeeded)
-        pip.assert_called_once_with(self.clone, "requirements.txt", "--no-deps", mock.ANY)
+        pip.assert_called_once_with(
+            self.clone, "requirements.txt", "--no-deps", mock.ANY, on_line=mock.ANY
+        )
 
     def test_is_local_checkout(self):
         self.assertTrue(pyappify.is_local_checkout())

@@ -1233,8 +1233,10 @@ def is_plain_checkout(start_dir=None):
         return False
 
 
-def get_version_list(number_versions=10, release_only=True, timeout=120, exit_event=None):
-    repo_path = find_repo_path()
+def get_version_list(
+    number_versions=10, release_only=True, timeout=120, exit_event=None, repo_path=None
+):
+    repo_path = repo_path or find_repo_path()
     _fetch_tags_logged(repo_path, timeout, exit_event)
     pulls = ()
     if not release_only and not is_launcher_layout(repo_path):
@@ -1247,13 +1249,53 @@ def get_version_list(number_versions=10, release_only=True, timeout=120, exit_ev
 def update_to_version(
     version, timeout=300, exit_event=None, app_version=None, app_profile=None
 ):
-    """Prepare an update to ``version`` and start the console updater.
+    """Prepare an update to ``version`` and start the updater.
 
     The app must exit for the update to apply; the updater stops it after
-    ``APP_EXIT_TIMEOUT_SECONDS`` and restarts it on the new version.
+    ``APP_EXIT_TIMEOUT_SECONDS`` and restarts it on the new version. The
+    updater shows a progress window when Tk is available (see
+    :mod:`pyappify.updater_ui`), else a console window.
     """
     log = get_logger()
-    repo_path = find_repo_path()
+    job = prepare_update_job(
+        version,
+        timeout=timeout,
+        exit_event=exit_event,
+        app_version=app_version,
+        app_profile=app_profile,
+        pid=os.getpid(),
+        relaunch=relaunch_info(),
+    )
+    job_path = write_update_job(job)
+    _process._raise_if_exit_requested(exit_event)
+    _start_updater(job_path)
+    log.info("pyappify started the standalone updater for %s; the app will restart", version)
+    return {
+        "updated": True,
+        "version": version,
+        "restart_required": True,
+        "update_note": job["update_note"],
+    }
+
+
+def prepare_update_job(
+    version,
+    timeout=300,
+    exit_event=None,
+    app_version=None,
+    app_profile=None,
+    repo_path=None,
+    pid=None,
+    relaunch=None,
+    exit_timeout=APP_EXIT_TIMEOUT_SECONDS,
+):
+    """Fetch what ``version`` needs and return the updater job for it.
+
+    Nothing in the app's files changes yet. ``pid`` is the app process the
+    updater stops first and ``relaunch`` (see :func:`relaunch_info`) how it
+    restarts the app; without them the updater does neither.
+    """
+    repo_path = repo_path or find_repo_path()
     managed = is_launcher_layout(repo_path)
     kind = KIND_TAG if managed else version_kind(version)
     # A local branch needs nothing from the remote, so it also works offline.
@@ -1281,9 +1323,8 @@ def update_to_version(
             update_note = []
         else:
             update_note = notes_for_update(repo, target_commit, current_commit)
-    job_dir = state_dir(repo_path)
 
-    job = {
+    return {
         "repo_path": repo_path,
         "version": version,
         "previous_version": previous_version,
@@ -1292,28 +1333,29 @@ def update_to_version(
         "previous_ref": previous_ref.decode("utf-8") if previous_ref else None,
         "update_note": update_note,
         "profile": app_profile,
-        "pid": os.getpid(),
-        "exit_timeout": APP_EXIT_TIMEOUT_SECONDS,
-        "relaunch": {
-            "argv": _relaunch_argv(),
-            "cwd": os.getcwd(),
-            "pythonpath": os.environ.get("PYTHONPATH"),
-        },
-        "refresh_shortcuts": True,
+        "pid": pid,
+        "exit_timeout": exit_timeout,
+        "relaunch": relaunch or {"argv": None, "cwd": None, "pythonpath": None},
+        "refresh_shortcuts": bool(relaunch),
     }
+
+
+def write_update_job(job):
+    """Write ``job`` to the state dir and return its path."""
+    job_dir = state_dir(job["repo_path"])
     os.makedirs(job_dir, exist_ok=True)
     job_path = os.path.join(job_dir, JOB_FILE_NAME)
     with open(job_path, "w", encoding="utf-8") as job_file:
         json.dump(job, job_file, indent=2, ensure_ascii=False)
+    return job_path
 
-    _process._raise_if_exit_requested(exit_event)
-    _start_updater(job_path)
-    log.info("pyappify started the standalone updater for %s; the app will restart", version)
+
+def relaunch_info():
+    """How the updater restarts this process: its command, folder and PYTHONPATH."""
     return {
-        "updated": True,
-        "version": version,
-        "restart_required": True,
-        "update_note": update_note,
+        "argv": _relaunch_argv(),
+        "cwd": os.getcwd(),
+        "pythonpath": os.environ.get("PYTHONPATH"),
     }
 
 
@@ -1333,7 +1375,20 @@ def _console_python():
     return executable
 
 
+def _gui_python():
+    """pythonw.exe next to python.exe, so a window opens without a console."""
+    executable = sys.executable
+    directory, name = os.path.split(executable)
+    if name.lower() == "python.exe":
+        candidate = os.path.join(directory, "pythonw.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    return executable
+
+
 def _start_updater(job_path):
+    from . import updater_ui
+
     package_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join(
@@ -1344,12 +1399,22 @@ def _start_updater(job_path):
     # not move a folder that is a process's current directory, and the updater
     # may move ``repo`` while converting an old launcher install.
     kwargs = {"cwd": os.path.dirname(job_path), "env": env, "close_fds": True}
+    if updater_ui.can_show_window():
+        python = _gui_python()
+        command = [python, "-m", "pyappify.updater_ui", "--job", job_path]
+        console = False
+    else:
+        python = _console_python()
+        command = [python, "-m", "pyappify.standalone_updater", job_path]
+        console = True
     if os.name == "nt":
-        kwargs["creationflags"] = (
-            subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP
-        )
+        if console:
+            window = subprocess.CREATE_NEW_CONSOLE
+        elif os.path.basename(python).lower() == "pythonw.exe":
+            window = subprocess.DETACHED_PROCESS
+        else:
+            window = subprocess.CREATE_NO_WINDOW
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | window
     else:
         kwargs["start_new_session"] = True
-    return subprocess.Popen(
-        [_console_python(), "-m", "pyappify.standalone_updater", job_path], **kwargs
-    )
+    return subprocess.Popen(command, **kwargs)
